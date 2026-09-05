@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use pit_artifact::ArtifactFormat;
+use pit_lane_core::{PitUri, ServiceInvocationRequest, ServiceInvoker};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
 use wasmparser::{Encoding, Parser, Payload};
@@ -29,9 +30,19 @@ use wasmtime_wasi::p2::add_to_linker_sync;
 use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p1::WasiP1Ctx};
 use wasmtime_wasi_http::bindings::http::types::Scheme;
-use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::body::{HyperIncomingBody, HyperOutgoingBody};
+use wasmtime_wasi_http::types::IncomingResponse;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
-use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::{HttpError, HttpResult, WasiHttpCtx, WasiHttpView};
+
+mod service_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../../pit-lane/crates/pit-lane-core/wit",
+        world: "service-consumer",
+        imports: { default: tracing },
+        require_store_data_send: true,
+    });
+}
 
 /// Stable identity for an artifact source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -355,6 +366,11 @@ impl PitRuntime {
                 let mut http_linker = ComponentLinker::new(&self.engine);
                 add_to_linker_sync(&mut http_linker)
                     .context("failed to link WASI Preview 2 HTTP base")?;
+                service_bindings::ServiceConsumer::add_to_linker::<
+                    _,
+                    wasmtime::component::HasSelf<_>,
+                >(&mut http_linker, |state| state)
+                .context("failed to link PitFast service capability")?;
                 wasmtime_wasi_http::add_only_http_to_linker_sync(&mut http_linker)
                     .context("failed to link WASI HTTP")?;
                 let http_pre = requested_world
@@ -638,6 +654,22 @@ impl PreparedArtifact {
         cancellation: CancellationToken,
         limits: ExecutionLimits,
     ) -> Result<HttpResponse> {
+        self.execute_http_with_invoker(request, cancellation, limits, None, None, 0)
+    }
+
+    /// Executes an HTTP component with an optional direct logical service
+    /// invoker. Nested calls stay inside the current host execution instead of
+    /// waiting for another scheduler lane, which prevents caller/callee
+    /// deadlocks when every lane is occupied.
+    pub fn execute_http_with_invoker(
+        &self,
+        request: &HttpRequest,
+        cancellation: CancellationToken,
+        limits: ExecutionLimits,
+        service_invoker: Option<Arc<dyn ServiceInvoker>>,
+        parent_execution_id: Option<String>,
+        invocation_depth: u16,
+    ) -> Result<HttpResponse> {
         let started = Instant::now();
         let body = Full::new(Bytes::from(request.body.clone()))
             .map_err(|never| match never {})
@@ -658,6 +690,9 @@ impl PreparedArtifact {
                 table: ResourceTable::new(),
                 http: WasiHttpCtx::new(),
                 limits: RuntimeLimiter::new(limits.memory_bytes),
+                service_invoker,
+                parent_execution_id,
+                invocation_depth,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -919,6 +954,9 @@ struct HttpHostState {
     table: ResourceTable,
     http: WasiHttpCtx,
     limits: RuntimeLimiter,
+    service_invoker: Option<Arc<dyn ServiceInvoker>>,
+    parent_execution_id: Option<String>,
+    invocation_depth: u16,
 }
 
 impl WasiView for P2HostState {
@@ -948,11 +986,142 @@ impl WasiHttpView for HttpHostState {
     }
     fn send_request(
         &mut self,
-        _request: hyper::Request<HyperOutgoingBody>,
-        _config: OutgoingRequestConfig,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
         use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-        Err(ErrorCode::HttpRequestDenied.into())
+        tracing::debug!(uri = %request.uri(), "WASI HTTP outgoing request");
+        let authority = request
+            .uri()
+            .authority()
+            .map(|authority| authority.as_str().to_owned())
+            .ok_or_else(|| HttpError::from(ErrorCode::HttpRequestUriInvalid))?;
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |path| path.as_str());
+        let target = format!("pit://{authority}{path}")
+            .parse::<PitUri>()
+            .map_err(|_| ErrorCode::HttpRequestDenied)?;
+        let invoker = self
+            .service_invoker
+            .clone()
+            .ok_or_else(|| HttpError::from(ErrorCode::HttpRequestDenied))?;
+        let method = request.method().clone();
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(|_| ErrorCode::HttpRequestDenied)?;
+        let body = wasmtime_wasi::runtime::in_tokio(request.into_body().collect())
+            .map_err(|_| ErrorCode::HttpRequestDenied)?
+            .to_bytes();
+        let invocation = ServiceInvocationRequest {
+            target,
+            method,
+            headers: headers
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        http::header::HeaderName::try_from(name).ok()?,
+                        http::HeaderValue::try_from(value).ok()?,
+                    ))
+                })
+                .collect(),
+            body,
+            parent_execution_id: self.parent_execution_id.clone(),
+            depth: self.invocation_depth.saturating_add(1),
+        };
+        // The synchronous v39 binding can call this hook while a Tokio bridge
+        // is active. Move the direct child execution off that bridge so the
+        // child can safely use its own WASI HTTP response bridge. It remains
+        // inline with respect to PitBox scheduling and consumes no new lane.
+        let response = std::thread::spawn(move || invoker.invoke(invocation))
+            .join()
+            .map_err(|_| ErrorCode::HttpRequestDenied)?
+            .map_err(|_| ErrorCode::HttpRequestDenied)?;
+        tracing::debug!(
+            status = response.status.as_u16(),
+            "WASI HTTP logical request completed"
+        );
+        let mut builder = hyper::Response::builder().status(response.status);
+        for (name, value) in response.headers {
+            if let Some(name) = name {
+                builder = builder.header(name, value);
+            }
+        }
+        let body: HyperIncomingBody = Full::new(response.body)
+            .map_err(|never| match never {})
+            .boxed();
+        let response = builder
+            .body(body)
+            .map_err(|_| ErrorCode::HttpRequestDenied)?;
+        let result = IncomingResponse {
+            resp: response,
+            worker: None,
+            between_bytes_timeout: config.between_bytes_timeout,
+        };
+        tracing::debug!("WASI HTTP outgoing response ready");
+        Ok(HostFutureIncomingResponse::pending(
+            wasmtime_wasi::runtime::spawn(async move { Ok(Ok(result)) }),
+        ))
+    }
+}
+
+impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
+    fn call(
+        &mut self,
+        request: service_bindings::pitfast::service::invoke::Request,
+    ) -> std::result::Result<
+        service_bindings::pitfast::service::invoke::Response,
+        service_bindings::pitfast::service::invoke::ServiceError,
+    > {
+        use service_bindings::pitfast::service::invoke::ServiceError;
+        let target = request
+            .uri
+            .parse::<PitUri>()
+            .map_err(|error| ServiceError::InvalidUri(error.to_string()))?;
+        let invoker = self
+            .service_invoker
+            .as_ref()
+            .ok_or_else(|| ServiceError::Unavailable("service invocation is not enabled".into()))?;
+        let method = http::Method::from_bytes(request.method.as_bytes())
+            .map_err(|error| ServiceError::Unavailable(format!("invalid method: {error}")))?;
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in request.headers {
+            let name = http::header::HeaderName::try_from(name.as_str())
+                .map_err(|error| ServiceError::Unavailable(format!("invalid header: {error}")))?;
+            let value = http::HeaderValue::try_from(value.as_str())
+                .map_err(|error| ServiceError::Unavailable(format!("invalid header: {error}")))?;
+            headers.append(name, value);
+        }
+        let response = invoker
+            .invoke(ServiceInvocationRequest {
+                target,
+                method,
+                headers,
+                body: Bytes::from(request.body),
+                parent_execution_id: self.parent_execution_id.clone(),
+                depth: self.invocation_depth.saturating_add(1),
+            })
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        Ok(service_bindings::pitfast::service::invoke::Response {
+            status: response.status.as_u16(),
+            headers: response
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value.to_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect(),
+            body: response.body.to_vec(),
+        })
     }
 }
 

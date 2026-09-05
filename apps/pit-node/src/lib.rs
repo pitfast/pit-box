@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use pit_artifact::{ArtifactFormat, ComponentWorld, RuntimeSpec};
+use pit_lane_core::ServiceInvoker;
 use pit_runtime::{PitRuntime, PreparedArtifact, RuntimeExecutionResult};
 use pit_scheduler::{
     ExecutionEvent, ExecutionId, ExecutionReport, LaneId, PitScheduler, SchedulerRun,
@@ -142,14 +143,33 @@ impl PitHttpDispatcher {
         limits: ExecutionLimits,
         cancellation: CancellationToken,
     ) -> Result<HttpDispatchResult> {
+        self.execute_http_with_invoker(key, request, limits, cancellation, None, 0)
+    }
+
+    pub fn execute_http_with_invoker(
+        &self,
+        key: &str,
+        request: HttpRequest,
+        limits: ExecutionLimits,
+        cancellation: CancellationToken,
+        service_invoker: Option<Arc<dyn ServiceInvoker>>,
+        invocation_depth: u16,
+    ) -> Result<HttpDispatchResult> {
         let prepared = self
             .artifacts
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
         let request = Arc::new(request);
-        let scheduled = self.scheduler.run_one(move |_, _| {
-            prepared.execute_http(&request, cancellation.clone(), limits.clone())
+        let scheduled = self.scheduler.run_one(move |execution_id, _| {
+            prepared.execute_http_with_invoker(
+                &request,
+                cancellation.clone(),
+                limits.clone(),
+                service_invoker,
+                Some(execution_id.to_string()),
+                invocation_depth,
+            )
         })?;
         let report = scheduled.report;
         Ok(HttpDispatchResult {
@@ -160,6 +180,34 @@ impl PitHttpDispatcher {
             queued_for: report.queued_for,
             duration: report.duration,
         })
+    }
+
+    /// Executes a nested service call inline on the caller's existing lane.
+    /// This is deliberately not submitted to the scheduler again: a full set
+    /// of callers waiting for callees would otherwise deadlock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_http_inline(
+        &self,
+        key: &str,
+        request: HttpRequest,
+        limits: ExecutionLimits,
+        cancellation: CancellationToken,
+        service_invoker: Option<Arc<dyn ServiceInvoker>>,
+        parent_execution_id: Option<String>,
+        invocation_depth: u16,
+    ) -> Result<HttpResponse> {
+        let prepared = self
+            .artifacts
+            .get(key)
+            .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
+        prepared.execute_http_with_invoker(
+            &request,
+            cancellation,
+            limits,
+            service_invoker,
+            parent_execution_id,
+            invocation_depth,
+        )
     }
 }
 

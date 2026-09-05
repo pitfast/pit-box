@@ -45,7 +45,7 @@ enforces execution limits, and returns structured results.
 pit-box is not the PitFast developer CLI, PitCrew builder, a cluster controller,
 a load balancer, or a container runtime. PitCrew turns source code into
 standardized artifacts; this repository executes already-built WASI Preview 1
-modules and WASI Preview 2 command components.
+modules and WASI Preview 2 command/HTTP components.
 
 PitBox supports manifest runtime ABIs wasi-preview1 and wasi-preview2. P1 uses
 the `_start` core-module entrypoint; P2 uses the `wasi:cli/command` component
@@ -66,13 +66,20 @@ PreparedArtifact
        ABI-independent scheduler
 ~~~
 
-P2 currently supports command-style components only. No WASI HTTP, custom WIT,
-filesystem preopens, or unrestricted network capability is enabled by default.
+P2 supports command-style and `wasi:http/proxy` components. PitBox also hosts
+the minimal `pitfast:service@0.1.0` invocation import when configured by
+PitLane. Filesystem preopens and unrestricted network capability are not
+enabled by default. The current v0.6 HTTP outgoing adapter intercepts
+registered logical authorities; raw TCP and external HTTP remain denied.
 
 Each request can provide guest arguments, explicit environment variables,
 captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host
 environment inheritance, stdin inheritance, filesystem exposure, and network
 exposure are disabled by default.
+
+Nested logical service calls are handled inline by the PitLane-backed host
+invoker rather than recursively submitted to the scheduler. This prevents all
+execution lanes from waiting on child calls.
 
 ## Quick start
 
