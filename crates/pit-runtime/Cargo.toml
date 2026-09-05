@@ -1,0 +1,11 @@
+[package]
+name = "pit-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded Wasmtime execution runtime for PitFast"
+
+[dependencies]
+anyhow.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
