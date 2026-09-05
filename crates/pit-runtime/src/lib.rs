@@ -26,7 +26,6 @@ use wasmtime::{
     Config, Engine, Linker as CoreLinker, Module, ResourceLimiter, Store, UpdateDeadline,
 };
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
-use wasmtime_wasi::p2::add_to_linker_sync;
 use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p1::WasiP1Ctx};
 use wasmtime_wasi_http::bindings::http::types::Scheme;
@@ -384,12 +383,25 @@ impl PitRuntime {
                     let component = Component::new(&self.engine, &bytes)
                         .context("WASM component preparation failed")?;
                     let mut linker = ComponentLinker::new(&self.engine);
-                    add_to_linker_sync(&mut linker).context("failed to link WASI Preview 2")?;
+                    let mut sync_wasi_options =
+                        wasmtime_wasi::p2::bindings::sync::LinkOptions::default();
+                    sync_wasi_options.cli_exit_with_code(true);
+                    wasmtime_wasi::p2::add_to_linker_with_options_sync(
+                        &mut linker,
+                        &sync_wasi_options,
+                    )
+                    .context("failed to link WASI Preview 2")?;
                     let http_component = Component::new(&self.http_engine, &bytes)
                         .context("WASM HTTP component preparation failed")?;
                     let mut http_linker = ComponentLinker::new(&self.http_engine);
-                    wasmtime_wasi::p2::add_to_linker_async(&mut http_linker)
-                        .context("failed to link WASI Preview 2 HTTP base")?;
+                    let mut async_wasi_options =
+                        wasmtime_wasi::p2::bindings::LinkOptions::default();
+                    async_wasi_options.cli_exit_with_code(true);
+                    wasmtime_wasi::p2::add_to_linker_with_options_async(
+                        &mut http_linker,
+                        &async_wasi_options,
+                    )
+                    .context("failed to link WASI Preview 2 HTTP base")?;
                     service_bindings::ServiceConsumer::add_to_linker::<
                         _,
                         wasmtime::component::HasSelf<_>,
