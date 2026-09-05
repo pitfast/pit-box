@@ -54,7 +54,10 @@ directory. The scheduler is ABI-independent.
 
 The runtime prepares a `Module` or `Component` once, reuses immutable Engine,
 linker, and compiled-artifact state, then creates a new Store, WASI context,
-resource table, output pipes, and limits for every invocation:
+resource table, output pipes, and limits for every invocation. P1 and command
+P2 use the synchronous engine; the `wasi:http/proxy` path uses a dedicated
+async-support engine because Wasmtime 39 does not permit synchronous instance
+calls on an async engine:
 
 ~~~text
 PreparedArtifact
@@ -66,11 +69,14 @@ PreparedArtifact
        ABI-independent scheduler
 ~~~
 
-P2 supports command-style and `wasi:http/proxy` components. PitBox also hosts
-the minimal `pitfast:service@0.1.0` invocation import when configured by
-PitLane. Filesystem preopens and unrestricted network capability are not
-enabled by default. The current v0.6 HTTP outgoing adapter intercepts
-registered logical authorities; raw TCP and external HTTP remain denied.
+P2 supports command-style and `wasi:http/proxy` components. HTTP execution uses
+the Wasmtime 39 asynchronous component path (`ProxyPre::instantiate_async` and
+`call_handle`) so bounded outgoing response bodies can be consumed fully.
+PitBox also hosts the minimal `pitfast:service@0.1.0` invocation import when
+configured by PitLane. Filesystem preopens and unrestricted network capability
+are not enabled by default. The HTTP outgoing adapter intercepts registered
+logical authorities; raw TCP, DNS, and external HTTP remain denied unless the
+request carries an exact host-owned resource endpoint allowlist.
 
 Each request can provide guest arguments, explicit environment variables,
 captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host

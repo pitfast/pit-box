@@ -39,7 +39,7 @@ mod service_bindings {
     wasmtime::component::bindgen!({
         path: "../../../pit-lane/crates/pit-lane-core/wit",
         world: "service-consumer",
-        imports: { default: tracing },
+        imports: { default: async },
         require_store_data_send: true,
     });
 }
@@ -257,6 +257,12 @@ pub struct HttpRequest {
     pub path_and_query: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Explicit guest environment for this request. The host environment is
+    /// never inherited implicitly.
+    pub env: Vec<(String, String)>,
+    /// Exact host-owned TCP endpoints the guest may connect to. Empty means
+    /// that TCP, UDP, and name lookup remain unavailable.
+    pub allowed_tcp: Vec<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,7 +314,9 @@ impl Drop for EpochTicker {
 /// Shared Wasmtime engine and preparation service.
 pub struct PitRuntime {
     engine: Engine,
+    http_engine: Engine,
     ticker: Arc<EpochTicker>,
+    http_ticker: Arc<EpochTicker>,
 }
 
 impl PitRuntime {
@@ -317,7 +325,18 @@ impl PitRuntime {
         config.epoch_interruption(true);
         let engine = Engine::new(&config).context("failed to create Wasmtime engine")?;
         let ticker = EpochTicker::start(engine.clone())?;
-        Ok(Self { engine, ticker })
+        let mut http_config = Config::new();
+        http_config.epoch_interruption(true);
+        http_config.async_support(true);
+        let http_engine =
+            Engine::new(&http_config).context("failed to create async HTTP engine")?;
+        let http_ticker = EpochTicker::start(http_engine.clone())?;
+        Ok(Self {
+            engine,
+            http_engine,
+            ticker,
+            http_ticker,
+        })
     }
 
     pub fn prepare(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
@@ -347,43 +366,56 @@ impl PitRuntime {
             ArtifactSource::Bytes(bytes) => bytes.to_vec(),
         };
         let format = detect_format(&bytes)?;
-        let (module, p1_linker, component, p2_linker, http_pre) = match format {
-            ArtifactFormat::CoreModule => (
-                Some(
-                    Module::from_binary(&self.engine, &bytes)
-                        .context("WASM module preparation failed")?,
+        let (module, p1_linker, component, p2_linker, http_pre, http_engine, http_ticker) =
+            match format {
+                ArtifactFormat::CoreModule => (
+                    Some(
+                        Module::from_binary(&self.engine, &bytes)
+                            .context("WASM module preparation failed")?,
+                    ),
+                    Some(core_linker(&self.engine)?),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
-                Some(core_linker(&self.engine)?),
-                None,
-                None,
-                None,
-            ),
-            ArtifactFormat::Component => {
-                let component = Component::new(&self.engine, &bytes)
-                    .context("WASM component preparation failed")?;
-                let mut linker = ComponentLinker::new(&self.engine);
-                add_to_linker_sync(&mut linker).context("failed to link WASI Preview 2")?;
-                let mut http_linker = ComponentLinker::new(&self.engine);
-                add_to_linker_sync(&mut http_linker)
-                    .context("failed to link WASI Preview 2 HTTP base")?;
-                service_bindings::ServiceConsumer::add_to_linker::<
-                    _,
-                    wasmtime::component::HasSelf<_>,
-                >(&mut http_linker, |state| state)
-                .context("failed to link PitFast service capability")?;
-                wasmtime_wasi_http::add_only_http_to_linker_sync(&mut http_linker)
-                    .context("failed to link WASI HTTP")?;
-                let http_pre = requested_world
-                    .filter(|world| *world == "wasi:http/proxy")
-                    .map(|_| {
-                        wasmtime_wasi_http::bindings::sync::ProxyPre::new(
-                            http_linker.instantiate_pre(&component)?,
-                        )
-                    })
-                    .transpose()?;
-                (None, None, Some(component), Some(linker), http_pre)
-            }
-        };
+                ArtifactFormat::Component => {
+                    let component = Component::new(&self.engine, &bytes)
+                        .context("WASM component preparation failed")?;
+                    let mut linker = ComponentLinker::new(&self.engine);
+                    add_to_linker_sync(&mut linker).context("failed to link WASI Preview 2")?;
+                    let http_component = Component::new(&self.http_engine, &bytes)
+                        .context("WASM HTTP component preparation failed")?;
+                    let mut http_linker = ComponentLinker::new(&self.http_engine);
+                    wasmtime_wasi::p2::add_to_linker_async(&mut http_linker)
+                        .context("failed to link WASI Preview 2 HTTP base")?;
+                    service_bindings::ServiceConsumer::add_to_linker::<
+                        _,
+                        wasmtime::component::HasSelf<_>,
+                    >(&mut http_linker, |state| state)
+                    .context("failed to link PitFast service capability")?;
+                    wasmtime_wasi_http::add_only_http_to_linker_async(&mut http_linker)
+                        .context("failed to link WASI HTTP")?;
+                    let http_pre = requested_world
+                        .filter(|world| *world == "wasi:http/proxy")
+                        .map(|_| {
+                            wasmtime_wasi_http::bindings::ProxyPre::new(
+                                http_linker.instantiate_pre(&http_component)?,
+                            )
+                        })
+                        .transpose()?;
+                    (
+                        None,
+                        None,
+                        Some(component),
+                        Some(linker),
+                        http_pre,
+                        Some(self.http_engine.clone()),
+                        Some(Arc::clone(&self.http_ticker)),
+                    )
+                }
+            };
         Ok(PreparedArtifact {
             engine: self.engine.clone(),
             module,
@@ -391,6 +423,8 @@ impl PitRuntime {
             component,
             p2_linker,
             http_pre,
+            http_engine,
+            http_ticker,
             artifact,
             ticker: Arc::clone(&self.ticker),
         })
@@ -409,7 +443,9 @@ pub struct PreparedArtifact {
     p1_linker: Option<CoreLinker<HostState>>,
     component: Option<Component>,
     p2_linker: Option<ComponentLinker<P2HostState>>,
-    http_pre: Option<wasmtime_wasi_http::bindings::sync::ProxyPre<HttpHostState>>,
+    http_pre: Option<wasmtime_wasi_http::bindings::ProxyPre<HttpHostState>>,
+    http_engine: Option<Engine>,
+    http_ticker: Option<Arc<EpochTicker>>,
     artifact: WasmArtifact,
     ticker: Arc<EpochTicker>,
 }
@@ -670,88 +706,118 @@ impl PreparedArtifact {
         parent_execution_id: Option<String>,
         invocation_depth: u16,
     ) -> Result<HttpResponse> {
-        let started = Instant::now();
-        let body = Full::new(Bytes::from(request.body.clone()))
-            .map_err(|never| match never {})
-            .boxed();
-        let mut builder = hyper::Request::builder()
-            .method(request.method.as_str())
-            .uri(request.path_and_query.as_str());
-        for (name, value) in &request.headers {
-            builder = builder.header(name, value);
-        }
-        let req = builder.body(body).context("invalid HTTP request")?;
-        let mut wasi = WasiCtxBuilder::new();
-        wasi.args(&["pit-http"]);
-        let mut store = Store::new(
-            &self.engine,
-            HttpHostState {
-                wasi: wasi.build(),
-                table: ResourceTable::new(),
-                http: WasiHttpCtx::new(),
-                limits: RuntimeLimiter::new(limits.memory_bytes),
-                service_invoker,
-                parent_execution_id,
-                invocation_depth,
-            },
-        );
-        store.limiter(|state| &mut state.limits);
-        let control = Arc::new(ExecutionControl::new(cancellation, limits.timeout));
-        let callback_control = Arc::clone(&control);
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_callback(move |_| {
-            if callback_control.token.is_cancelled() {
-                callback_control
-                    .signal
-                    .store(ControlSignal::Cancelled as u8, Ordering::Release);
-                return Ok(UpdateDeadline::Interrupt);
+        wasmtime_wasi::runtime::in_tokio(async {
+            let http_engine = self
+                .http_engine
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTTP engine was not prepared"))?;
+            let _http_ticker = self
+                .http_ticker
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTTP epoch ticker was not prepared"))?;
+            let body = Full::new(Bytes::from(request.body.clone()))
+                .map_err(|never| match never {})
+                .boxed();
+            let mut builder = hyper::Request::builder()
+                .method(request.method.as_str())
+                .uri(request.path_and_query.as_str());
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
             }
-            if callback_control.timed_out() {
-                callback_control
-                    .signal
-                    .store(ControlSignal::TimedOut as u8, Ordering::Release);
-                return Ok(UpdateDeadline::Interrupt);
+            let req = builder.body(body).context("invalid HTTP request")?;
+            let mut wasi = WasiCtxBuilder::new();
+            wasi.args(&["pit-http"]);
+            wasi.envs(&request.env);
+            let allowed_tcp = request.allowed_tcp.clone();
+            wasi.allow_tcp(!allowed_tcp.is_empty())
+                .allow_udp(false)
+                .allow_ip_name_lookup(false)
+                .socket_addr_check(move |address, use_kind| {
+                    let allowed_tcp = allowed_tcp.clone();
+                    Box::pin(async move {
+                        matches!(use_kind, wasmtime_wasi::sockets::SocketAddrUse::TcpConnect)
+                            && allowed_tcp.contains(&address)
+                    })
+                });
+            let mut store = Store::new(
+                http_engine,
+                HttpHostState {
+                    wasi: wasi.build(),
+                    table: ResourceTable::new(),
+                    http: WasiHttpCtx::new(),
+                    limits: RuntimeLimiter::new(limits.memory_bytes),
+                    service_invoker,
+                    parent_execution_id,
+                    invocation_depth,
+                },
+            );
+            store.limiter(|state| &mut state.limits);
+            let control = Arc::new(ExecutionControl::new(cancellation, limits.timeout));
+            let callback_control = Arc::clone(&control);
+            store.set_epoch_deadline(1);
+            store.epoch_deadline_callback(move |_| {
+                if callback_control.token.is_cancelled() {
+                    callback_control
+                        .signal
+                        .store(ControlSignal::Cancelled as u8, Ordering::Release);
+                    return Ok(UpdateDeadline::Interrupt);
+                }
+                if callback_control.timed_out() {
+                    callback_control
+                        .signal
+                        .store(ControlSignal::TimedOut as u8, Ordering::Release);
+                    return Ok(UpdateDeadline::Interrupt);
+                }
+                Ok(UpdateDeadline::Continue(1))
+            });
+            let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let output = store.data_mut().new_response_outparam(sender)?;
+            let proxy = self
+                .http_pre
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTTP proxy was not prepared"))?
+                .instantiate_async(&mut store)
+                .await?;
+            let handler = wasmtime_wasi::runtime::spawn(async move {
+                let result = proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(&mut store, req, output)
+                    .await;
+                (store, result)
+            });
+            // Wait for the guest handler before consuming the response body.
+            // This keeps a guest that is itself consuming an outgoing response
+            // from being coupled to the host's collection of its outer body.
+            let (store, call_result) = handler.await;
+            if let Err(error) = call_result {
+                return Err(anyhow!("WASI HTTP incoming handler failed: {error:#}"));
             }
-            Ok(UpdateDeadline::Continue(1))
-        });
-        let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let output = store.data_mut().new_response_outparam(sender)?;
-        let proxy = self
-            .http_pre
-            .as_ref()
-            .ok_or_else(|| anyhow!("HTTP proxy was not prepared"))?
-            .instantiate(&mut store)?;
-        let call_result = proxy
-            .wasi_http_incoming_handler()
-            .call_handle(&mut store, req, output);
-        let response = wasmtime_wasi::runtime::in_tokio(receiver)
-            .map_err(|_| anyhow!("HTTP guest dropped response output"))??;
-        call_result.context("WASI HTTP incoming handler failed")?;
-        let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
+            let response = receiver
+                .await
+                .map_err(|_| anyhow!("HTTP guest dropped response output"))??;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let body = response.into_body().collect().await?.to_bytes().to_vec();
+            match control.signal() {
+                ControlSignal::Cancelled => bail!("HTTP execution was cancelled"),
+                ControlSignal::TimedOut => bail!("HTTP execution exceeded its timeout"),
+                ControlSignal::None if store.data().limits.memory_exceeded => {
+                    bail!("HTTP execution exceeded its memory limit")
+                }
+                ControlSignal::None => {}
+            }
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let body = wasmtime_wasi::runtime::in_tokio(response.into_body().collect())?
-            .to_bytes()
-            .to_vec();
-        match control.signal() {
-            ControlSignal::Cancelled => bail!("HTTP execution was cancelled"),
-            ControlSignal::TimedOut => bail!("HTTP execution exceeded its timeout"),
-            ControlSignal::None if store.data().limits.memory_exceeded => {
-                bail!("HTTP execution exceeded its memory limit")
-            }
-            ControlSignal::None => {}
-        }
-        let _ = started;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
         })
     }
 
@@ -1016,9 +1082,8 @@ impl WasiHttpView for HttpHostState {
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|_| ErrorCode::HttpRequestDenied)?;
-        let body = wasmtime_wasi::runtime::in_tokio(request.into_body().collect())
-            .map_err(|_| ErrorCode::HttpRequestDenied)?
-            .to_bytes();
+        let body =
+            collect_http_body(request.into_body()).map_err(|_| ErrorCode::HttpRequestDenied)?;
         let invocation = ServiceInvocationRequest {
             target,
             method,
@@ -1047,7 +1112,9 @@ impl WasiHttpView for HttpHostState {
             status = response.status.as_u16(),
             "WASI HTTP logical request completed"
         );
+        let response_body_len = response.body.len();
         let mut builder = hyper::Response::builder().status(response.status);
+        builder = builder.header(http::header::CONTENT_LENGTH, response_body_len);
         for (name, value) in response.headers {
             if let Some(name) = name {
                 builder = builder.header(name, value);
@@ -1065,14 +1132,21 @@ impl WasiHttpView for HttpHostState {
             between_bytes_timeout: config.between_bytes_timeout,
         };
         tracing::debug!("WASI HTTP outgoing response ready");
-        Ok(HostFutureIncomingResponse::pending(
-            wasmtime_wasi::runtime::spawn(async move { Ok(Ok(result)) }),
-        ))
+        Ok(HostFutureIncomingResponse::ready(Ok(Ok(result))))
     }
 }
 
+fn collect_http_body(body: HyperOutgoingBody) -> Result<Bytes> {
+    let collected = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(body.collect())),
+        Err(_) => wasmtime_wasi::runtime::in_tokio(body.collect()),
+    }
+    .map_err(|error| anyhow!("HTTP request body collection failed: {error}"))?;
+    Ok(collected.to_bytes())
+}
+
 impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
-    fn call(
+    async fn call(
         &mut self,
         request: service_bindings::pitfast::service::invoke::Request,
     ) -> std::result::Result<
@@ -1098,16 +1172,22 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
                 .map_err(|error| ServiceError::Unavailable(format!("invalid header: {error}")))?;
             headers.append(name, value);
         }
-        let response = invoker
-            .invoke(ServiceInvocationRequest {
+        let parent_execution_id = self.parent_execution_id.clone();
+        let depth = self.invocation_depth.saturating_add(1);
+        let invoker = Arc::clone(invoker);
+        let response = std::thread::spawn(move || {
+            invoker.invoke(ServiceInvocationRequest {
                 target,
                 method,
                 headers,
                 body: Bytes::from(request.body),
-                parent_execution_id: self.parent_execution_id.clone(),
-                depth: self.invocation_depth.saturating_add(1),
+                parent_execution_id,
+                depth,
             })
-            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        })
+        .join()
+        .map_err(|_| ServiceError::Unavailable("service invocation thread panicked".into()))?
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
         Ok(service_bindings::pitfast::service::invoke::Response {
             status: response.status.as_u16(),
             headers: response
