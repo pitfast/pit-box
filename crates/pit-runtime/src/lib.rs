@@ -14,6 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use pit_artifact::ArtifactFormat;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
@@ -26,6 +28,10 @@ use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p2::add_to_linker_sync;
 use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p1::WasiP1Ctx};
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
+use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
 
 /// Stable identity for an artifact source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -234,6 +240,21 @@ pub struct RuntimeExecutionResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 struct EpochTicker {
     stop: Arc<AtomicBool>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -303,7 +324,7 @@ impl PitRuntime {
             ArtifactSource::Bytes(bytes) => bytes.to_vec(),
         };
         let format = detect_format(&bytes)?;
-        let (module, p1_linker, component, p2_linker) = match format {
+        let (module, p1_linker, component, p2_linker, http_linker) = match format {
             ArtifactFormat::CoreModule => (
                 Some(
                     Module::from_binary(&self.engine, &bytes)
@@ -312,13 +333,19 @@ impl PitRuntime {
                 Some(core_linker(&self.engine)?),
                 None,
                 None,
+                None,
             ),
             ArtifactFormat::Component => {
                 let component = Component::new(&self.engine, &bytes)
                     .context("WASM component preparation failed")?;
                 let mut linker = ComponentLinker::new(&self.engine);
                 add_to_linker_sync(&mut linker).context("failed to link WASI Preview 2")?;
-                (None, None, Some(component), Some(linker))
+                let mut http_linker = ComponentLinker::new(&self.engine);
+                add_to_linker_sync(&mut http_linker)
+                    .context("failed to link WASI Preview 2 HTTP base")?;
+                wasmtime_wasi_http::add_only_http_to_linker_sync(&mut http_linker)
+                    .context("failed to link WASI HTTP")?;
+                (None, None, Some(component), Some(linker), Some(http_linker))
             }
         };
         Ok(PreparedArtifact {
@@ -327,6 +354,7 @@ impl PitRuntime {
             p1_linker,
             component,
             p2_linker,
+            http_linker,
             artifact,
             ticker: Arc::clone(&self.ticker),
         })
@@ -345,6 +373,7 @@ pub struct PreparedArtifact {
     p1_linker: Option<CoreLinker<HostState>>,
     component: Option<Component>,
     p2_linker: Option<ComponentLinker<P2HostState>>,
+    http_linker: Option<ComponentLinker<HttpHostState>>,
     artifact: WasmArtifact,
     ticker: Arc<EpochTicker>,
 }
@@ -581,6 +610,100 @@ impl PreparedArtifact {
         Ok(result)
     }
 
+    /// Executes one request against a prepared `wasi:http/proxy` component.
+    /// The caller is responsible for scheduling this operation on a PitBox lane.
+    pub fn execute_http(
+        &self,
+        request: &HttpRequest,
+        cancellation: CancellationToken,
+        limits: ExecutionLimits,
+    ) -> Result<HttpResponse> {
+        let started = Instant::now();
+        let body = Full::new(Bytes::from(request.body.clone()))
+            .map_err(|never| match never {})
+            .boxed();
+        let mut builder = hyper::Request::builder()
+            .method(request.method.as_str())
+            .uri(request.path_and_query.as_str());
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        let req = builder.body(body).context("invalid HTTP request")?;
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.args(&["pit-http"]);
+        let mut store = Store::new(
+            &self.engine,
+            HttpHostState {
+                wasi: wasi.build(),
+                table: ResourceTable::new(),
+                http: WasiHttpCtx::new(),
+                limits: RuntimeLimiter::new(limits.memory_bytes),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        let control = Arc::new(ExecutionControl::new(cancellation, limits.timeout));
+        let callback_control = Arc::clone(&control);
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            if callback_control.token.is_cancelled() {
+                callback_control
+                    .signal
+                    .store(ControlSignal::Cancelled as u8, Ordering::Release);
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            if callback_control.timed_out() {
+                callback_control
+                    .signal
+                    .store(ControlSignal::TimedOut as u8, Ordering::Release);
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+        let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let output = store.data_mut().new_response_outparam(sender)?;
+        let proxy = wasmtime_wasi_http::bindings::sync::Proxy::instantiate(
+            &mut store,
+            self.component
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTTP execution requires a component"))?,
+            self.http_linker
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTTP linker was not prepared"))?,
+        )?;
+        let call_result = proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, req, output);
+        let response = wasmtime_wasi::runtime::in_tokio(receiver)
+            .map_err(|_| anyhow!("HTTP guest dropped response output"))??;
+        call_result.context("WASI HTTP incoming handler failed")?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let body = wasmtime_wasi::runtime::in_tokio(response.into_body().collect())?
+            .to_bytes()
+            .to_vec();
+        match control.signal() {
+            ControlSignal::Cancelled => bail!("HTTP execution was cancelled"),
+            ControlSignal::TimedOut => bail!("HTTP execution exceeded its timeout"),
+            ControlSignal::None if store.data().limits.memory_exceeded => {
+                bail!("HTTP execution exceeded its memory limit")
+            }
+            ControlSignal::None => {}
+        }
+        let _ = started;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
     fn result(
         status: ExecutionStatus,
         exit_code: Option<i32>,
@@ -775,12 +898,45 @@ struct P2HostState {
     limits: RuntimeLimiter,
 }
 
+struct HttpHostState {
+    wasi: WasiCtx,
+    table: ResourceTable,
+    http: WasiHttpCtx,
+    limits: RuntimeLimiter,
+}
+
 impl WasiView for P2HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+impl WasiView for HttpHostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for HttpHostState {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http
+    }
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+    fn send_request(
+        &mut self,
+        _request: hyper::Request<HyperOutgoingBody>,
+        _config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+        Err(ErrorCode::HttpRequestDenied.into())
     }
 }
 

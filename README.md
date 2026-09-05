@@ -2,6 +2,12 @@
 
 PitFast is a WebAssembly-native execution runtime.
 
+PitBox is the local execution engine: it owns Wasmtime preparation, isolated
+stores, WASI capabilities, limits, and the bounded scheduler. It supports WASI
+Preview 1 core modules, WASI Preview 2 command components, and
+`wasi:http/proxy` components. Network ingress and logical service routing live
+in the independent PitLane repository.
+
 No pods. No containers. Just isolated WASM execution scheduled across available
 CPU lanes.
 

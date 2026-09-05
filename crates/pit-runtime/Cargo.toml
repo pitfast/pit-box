@@ -7,11 +7,16 @@ description = "Embedded Wasmtime execution runtime for PitFast"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
 pit-artifact.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
+wasmtime-wasi-http.workspace = true
 wasmparser.workspace = true
 
 [dev-dependencies]

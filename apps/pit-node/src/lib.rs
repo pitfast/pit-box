@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
-use pit_artifact::{ArtifactFormat, RuntimeSpec};
+use pit_artifact::{ArtifactFormat, ComponentWorld, RuntimeSpec};
 use pit_runtime::{PitRuntime, PreparedArtifact, RuntimeExecutionResult};
 use pit_scheduler::{
     ExecutionEvent, ExecutionId, ExecutionReport, LaneId, PitScheduler, SchedulerRun,
@@ -14,7 +14,7 @@ use pit_scheduler::{
 
 pub use pit_runtime::{
     ArtifactId, ArtifactSource, CancellationToken, ExecutionLimits, ExecutionRequest,
-    ExecutionStatus, WasmArtifact, validate_env_entry,
+    ExecutionStatus, HttpRequest, HttpResponse, WasmArtifact, validate_env_entry,
 };
 
 /// Validate a project artifact's runtime contract against this local PitBox.
@@ -32,7 +32,10 @@ pub fn validate_runtime_spec(spec: &RuntimeSpec) -> Result<()> {
         ),
         "wasi-preview2" => (
             ArtifactFormat::Component,
-            pit_artifact::WASI_PREVIEW2_ENTRYPOINT,
+            match spec.world {
+                Some(ComponentWorld::WasiHttpProxy) => pit_artifact::WASI_HTTP_PROXY_WORLD,
+                _ => pit_artifact::WASI_PREVIEW2_ENTRYPOINT,
+            },
         ),
         _ => unreachable!(),
     };
@@ -89,6 +92,75 @@ pub struct NodeRunReport {
 pub struct PitNode {
     prepared: Arc<PreparedArtifact>,
     scheduler: PitScheduler,
+}
+
+/// Shared prepared-artifact HTTP dispatcher. Services registered by PitLane use
+/// one scheduler, so all HTTP components consume the same execution grid.
+pub struct PitHttpDispatcher {
+    runtime: PitRuntime,
+    scheduler: PitScheduler,
+    artifacts: std::collections::HashMap<String, Arc<PreparedArtifact>>,
+}
+
+#[derive(Debug)]
+pub struct HttpDispatchResult {
+    pub execution_id: ExecutionId,
+    pub lane_id: LaneId,
+    pub response: Option<HttpResponse>,
+    pub error: Option<String>,
+    pub queued_for: Duration,
+    pub duration: Duration,
+}
+
+impl PitHttpDispatcher {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            runtime: PitRuntime::new()?,
+            scheduler: PitScheduler::local(),
+            artifacts: std::collections::HashMap::new(),
+        })
+    }
+
+    pub fn execution_lanes(&self) -> usize {
+        self.scheduler.lane_count()
+    }
+
+    pub fn shared_peak_active(&self) -> usize {
+        self.scheduler.shared_peak_active()
+    }
+
+    pub fn register(&mut self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
+        let prepared = self.runtime.prepare(artifact)?;
+        self.artifacts.insert(key.into(), Arc::new(prepared));
+        Ok(())
+    }
+
+    pub fn execute_http(
+        &self,
+        key: &str,
+        request: HttpRequest,
+        limits: ExecutionLimits,
+        cancellation: CancellationToken,
+    ) -> Result<HttpDispatchResult> {
+        let prepared = self
+            .artifacts
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
+        let request = Arc::new(request);
+        let scheduled = self.scheduler.run_one(move |_, _| {
+            prepared.execute_http(&request, cancellation.clone(), limits.clone())
+        })?;
+        let report = scheduled.report;
+        Ok(HttpDispatchResult {
+            execution_id: report.execution_id,
+            lane_id: report.lane_id,
+            response: scheduled.value,
+            error: report.error,
+            queued_for: report.queued_for,
+            duration: report.duration,
+        })
+    }
 }
 
 impl PitNode {

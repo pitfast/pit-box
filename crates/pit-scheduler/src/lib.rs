@@ -177,6 +177,9 @@ pub struct PitScheduler {
     lanes: Arc<[ExecutionLane]>,
     next_execution_id: Arc<AtomicU64>,
     run_lock: Arc<Mutex<()>>,
+    shared_lanes: Arc<(Mutex<Vec<bool>>, std::sync::Condvar)>,
+    shared_active: Arc<AtomicUsize>,
+    shared_peak: Arc<AtomicUsize>,
 }
 
 impl PitScheduler {
@@ -194,6 +197,12 @@ impl PitScheduler {
             lanes,
             next_execution_id: Arc::new(AtomicU64::new(0)),
             run_lock: Arc::new(Mutex::new(())),
+            shared_lanes: Arc::new((
+                Mutex::new(vec![false; lane_count]),
+                std::sync::Condvar::new(),
+            )),
+            shared_active: Arc::new(AtomicUsize::new(0)),
+            shared_peak: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -210,6 +219,12 @@ impl PitScheduler {
             lanes,
             next_execution_id: Arc::new(AtomicU64::new(0)),
             run_lock: Arc::new(Mutex::new(())),
+            shared_lanes: Arc::new((
+                Mutex::new(vec![false; lane_count]),
+                std::sync::Condvar::new(),
+            )),
+            shared_active: Arc::new(AtomicUsize::new(0)),
+            shared_peak: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -221,6 +236,60 @@ impl PitScheduler {
     /// Returns the scheduler's lane descriptors.
     pub fn lanes(&self) -> &[ExecutionLane] {
         &self.lanes
+    }
+
+    /// Peak occupancy observed by the shared single-task API.
+    pub fn shared_peak_active(&self) -> usize {
+        self.shared_peak.load(Ordering::Acquire)
+    }
+
+    /// Runs one task using the scheduler's shared lane pool. Unlike a batch,
+    /// concurrent callers can occupy different lanes; this is the ingress API
+    /// used by PitLane.
+    pub fn run_one<T, F>(&self, task: F) -> Result<ExecutionResult<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(ExecutionId, LaneId) -> Result<T>,
+    {
+        let execution_id = ExecutionId(self.next_execution_id.fetch_add(1, Ordering::Relaxed));
+        let queued_at = Instant::now();
+        let (lock, wake) = &*self.shared_lanes;
+        let mut occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lane = loop {
+            if let Some((index, slot)) = occupied.iter_mut().enumerate().find(|(_, used)| !**used) {
+                *slot = true;
+                break LaneId(index);
+            }
+            occupied = wake
+                .wait(occupied)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        };
+        drop(occupied);
+        let active = self.shared_active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared_peak.fetch_max(active, Ordering::AcqRel);
+        let queued_for = queued_at.elapsed();
+        let started = SystemTime::now();
+        let timer = Instant::now();
+        let outcome = task(execution_id, lane);
+        let duration = timer.elapsed();
+        let (success, error, value) = match outcome {
+            Ok(value) => (true, None, Some(value)),
+            Err(error) => (false, Some(error.to_string()), None),
+        };
+        let report = ExecutionReport {
+            execution_id,
+            lane_id: lane,
+            started,
+            queued_for,
+            duration,
+            success,
+            error,
+        };
+        let mut occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        occupied[lane.0] = false;
+        self.shared_active.fetch_sub(1, Ordering::AcqRel);
+        wake.notify_one();
+        Ok(ExecutionResult { report, value })
     }
 
     /// Runs `count` jobs and returns results plus lifecycle telemetry.
