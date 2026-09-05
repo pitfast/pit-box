@@ -36,9 +36,10 @@ pit-box is the safe local WASM execution system. It validates an execution
 request, prepares and reuses a compiled artifact, schedules isolated Stores,
 enforces execution limits, and returns structured results.
 
-pit-box is not the PitCrew builder, a cluster controller, a load balancer, or a
-container runtime. PitCrew will eventually turn source code into standardized
-artifacts; this repository executes already-built WASI Preview 1 modules.
+pit-box is not the PitFast developer CLI, PitCrew builder, a cluster controller,
+a load balancer, or a container runtime. PitCrew turns source code into
+standardized artifacts; this repository executes already-built WASI Preview 1
+modules.
 
 Each request can provide guest arguments, explicit environment variables,
 captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host
@@ -65,28 +66,29 @@ rustc --target wasm32-wasip1 -O examples/memory-grow/src/main.rs -o examples/mem
 rustc --target wasm32-wasip1 -O examples/exit/src/main.rs -o examples/exit.wasm
 ~~~
 
-Inspect the local execution hardware:
+Build the standalone developer CLI from the sibling pit-cli repository, then
+inspect the local execution hardware:
 
 ~~~bash
-cargo run -p pit -- system
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- system
 ~~~
 
 Run one or many independent invocations:
 
 ~~~bash
-cargo run -p pit -- run ./examples/hello.wasm
-cargo run -p pit -- run ./examples/hello.wasm --concurrency 100
-cargo run -p pit -- run ./examples/hello.wasm -- hello world
-cargo run -p pit -- run ./examples/env.wasm --env MODE=production --env REGION=jakarta
-cargo run -p pit -- run ./examples/infinite-loop.wasm --timeout 500ms
-cargo run -p pit -- run ./examples/memory-grow.wasm --memory 8MiB
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/hello.wasm
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/hello.wasm --concurrency 100
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/hello.wasm -- hello world
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/env.wasm --env MODE=production --env REGION=jakarta
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/infinite-loop.wasm --timeout 500ms
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/memory-grow.wasm --memory 8MiB
 ~~~
 
 Run the CPU-bound benchmark with release optimizations:
 
 ~~~bash
-cargo run --release -p pit -- run ./examples/cpu-burn.wasm --concurrency 100
-cargo run --release -p pit -- bench ./examples/cpu-burn.wasm
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- run ./examples/cpu-burn.wasm --concurrency 100
+cargo run --release --manifest-path ../pit-cli/Cargo.toml -- bench ./examples/cpu-burn.wasm
 ~~~
 
 Use --verbose on pit run to print queued, started, completed, and failed
