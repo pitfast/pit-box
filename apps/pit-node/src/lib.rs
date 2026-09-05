@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use pit_runtime::PitRuntime;
-use pit_scheduler::{ExecutionReport, PitScheduler};
+use pit_scheduler::{ExecutionEvent, ExecutionReport, PitScheduler, SchedulerSnapshot};
 
 /// A local PitFast node: one compiled artifact and a bounded execution scheduler.
 pub struct PitNode {
@@ -22,6 +22,9 @@ pub struct NodeRunReport {
     pub completed: usize,
     pub failed: usize,
     pub total_duration: Duration,
+    pub peak_active: usize,
+    pub snapshot: SchedulerSnapshot,
+    pub events: Vec<ExecutionEvent>,
     pub executions: Vec<ExecutionReport>,
 }
 
@@ -43,9 +46,14 @@ impl PitNode {
     pub fn run(&self, concurrency: usize) -> Result<NodeRunReport> {
         let started = Instant::now();
         let runtime = Arc::clone(&self.runtime);
-        let results = self
+        let scheduler_run = self
             .scheduler
-            .run_many(concurrency, move |_, _| runtime.run_once())?;
+            .run_many_detailed(concurrency, move |_, _| runtime.run_once())?;
+        let pit_scheduler::SchedulerRun {
+            results,
+            events,
+            snapshot,
+        } = scheduler_run;
         let completed = results
             .iter()
             .filter(|result| result.report.success)
@@ -60,6 +68,9 @@ impl PitNode {
             completed,
             failed,
             total_duration: started.elapsed(),
+            peak_active: snapshot.peak_active,
+            snapshot,
+            events,
             executions,
         })
     }
