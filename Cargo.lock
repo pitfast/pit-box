@@ -1207,6 +1207,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "wasmparser 0.240.0",
 ]
 
 [[package]]
@@ -1226,8 +1227,10 @@ name = "pit-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pit-artifact",
  "sha2",
  "tokio",
+ "wasmparser 0.240.0",
  "wasmtime",
  "wasmtime-wasi",
  "wat",

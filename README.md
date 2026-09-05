@@ -5,8 +5,8 @@ PitFast is a WebAssembly-native execution runtime.
 No pods. No containers. Just isolated WASM execution scheduled across available
 CPU lanes.
 
-This repository is the local execution foundation. The MVP embeds Wasmtime,
-compiles one WASI Preview 1 module once, and schedules independent invocations
+This repository is the local execution foundation. It embeds Wasmtime, prepares
+one WASI Preview 1 module or WASI Preview 2 component once, and schedules independent invocations
 across a bounded set of host threads. It does not create a process per
 invocation.
 
@@ -39,11 +39,29 @@ enforces execution limits, and returns structured results.
 pit-box is not the PitFast developer CLI, PitCrew builder, a cluster controller,
 a load balancer, or a container runtime. PitCrew turns source code into
 standardized artifacts; this repository executes already-built WASI Preview 1
-modules.
+modules and WASI Preview 2 command components.
 
-PitBox currently supports the manifest runtime ABI wasi-preview1 and the
-entrypoint _start when called through the project artifact contract. Raw
-WasmArtifact values remain supported and do not require a .pit directory.
+PitBox supports manifest runtime ABIs wasi-preview1 and wasi-preview2. P1 uses
+the `_start` core-module entrypoint; P2 uses the `wasi:cli/command` component
+world. Raw WasmArtifact values remain supported and do not require a .pit
+directory. The scheduler is ABI-independent.
+
+The runtime prepares a `Module` or `Component` once, reuses immutable Engine,
+linker, and compiled-artifact state, then creates a new Store, WASI context,
+resource table, output pipes, and limits for every invocation:
+
+~~~text
+PreparedArtifact
+   ├── PreparedModule     (WASI Preview 1)
+   └── PreparedComponent  (WASI Preview 2)
+             ↓
+       common ExecutionResult
+             ↓
+       ABI-independent scheduler
+~~~
+
+P2 currently supports command-style components only. No WASI HTTP, custom WIT,
+filesystem preopens, or unrestricted network capability is enabled by default.
 
 Each request can provide guest arguments, explicit environment variables,
 captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host

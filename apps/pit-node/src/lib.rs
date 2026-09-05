@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
-use pit_artifact::RuntimeSpec;
+use pit_artifact::{ArtifactFormat, RuntimeSpec};
 use pit_runtime::{PitRuntime, PreparedArtifact, RuntimeExecutionResult};
 use pit_scheduler::{
     ExecutionEvent, ExecutionId, ExecutionReport, LaneId, PitScheduler, SchedulerRun,
@@ -21,15 +21,33 @@ pub use pit_runtime::{
 pub fn validate_runtime_spec(spec: &RuntimeSpec) -> Result<()> {
     if !spec.abi.is_supported() {
         bail!(
-            "unsupported runtime ABI '{}'; this PitBox supports wasi-preview1",
+            "unsupported runtime ABI '{}'; this PitBox supports wasi-preview1 and wasi-preview2",
             spec.abi.as_str()
         );
     }
-    if spec.entrypoint != pit_artifact::WASI_PREVIEW1_ENTRYPOINT {
+    let expected = match spec.abi.as_str() {
+        "wasi-preview1" => (
+            ArtifactFormat::CoreModule,
+            pit_artifact::WASI_PREVIEW1_ENTRYPOINT,
+        ),
+        "wasi-preview2" => (
+            ArtifactFormat::Component,
+            pit_artifact::WASI_PREVIEW2_ENTRYPOINT,
+        ),
+        _ => unreachable!(),
+    };
+    if spec.format != expected.0 {
         bail!(
-            "unsupported WASI Preview 1 entrypoint '{}'; expected {}",
-            spec.entrypoint,
-            pit_artifact::WASI_PREVIEW1_ENTRYPOINT
+            "runtime ABI '{}' requires the {} artifact format",
+            spec.abi.as_str(),
+            expected.0
+        );
+    }
+    if spec.entrypoint.as_str() != expected.1 {
+        bail!(
+            "unsupported entrypoint '{}'; expected {}",
+            spec.entrypoint.as_str(),
+            expected.1
         );
     }
     Ok(())
@@ -91,6 +109,14 @@ impl PitNode {
 
     pub fn artifact(&self) -> &WasmArtifact {
         self.prepared.artifact()
+    }
+
+    pub fn default_entrypoint(&self) -> &'static str {
+        self.prepared.default_entrypoint()
+    }
+
+    pub fn measure_instantiation(&self, request: &ExecutionRequest) -> Result<Duration> {
+        self.prepared.measure_instantiation(request)
     }
 
     pub fn execution_lanes(&self) -> usize {

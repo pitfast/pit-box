@@ -1,4 +1,4 @@
-//! Reusable, constrained WASI Preview 1 execution for PitFast.
+//! Reusable, constrained WASI Preview 1 and Preview 2 execution for PitFast.
 //!
 //! The runtime owns one shared Wasmtime engine, prepares artifacts once, and
 //! creates a fresh Store and WASI context for every invocation.
@@ -14,11 +14,18 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use pit_artifact::ArtifactFormat;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
-use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, UpdateDeadline};
+use wasmparser::{Encoding, Parser, Payload};
+use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
+use wasmtime::{
+    Config, Engine, Linker as CoreLinker, Module, ResourceLimiter, Store, UpdateDeadline,
+};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
-use wasmtime_wasi::{I32Exit, WasiCtxBuilder, p1::WasiP1Ctx};
+use wasmtime_wasi::p2::add_to_linker_sync;
+use wasmtime_wasi::p2::bindings::sync::Command;
+use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p1::WasiP1Ctx};
 
 /// Stable identity for an artifact source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,7 +50,7 @@ pub enum ArtifactSource {
     Bytes(Arc<[u8]>),
 }
 
-/// A WASI Preview 1 artifact independent of CLI path handling.
+/// A raw WebAssembly artifact independent of CLI path and manifest handling.
 #[derive(Debug, Clone)]
 pub struct WasmArtifact {
     id: ArtifactId,
@@ -282,7 +289,7 @@ impl PitRuntime {
     }
 
     pub fn prepare(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
-        let module = match artifact.source() {
+        let bytes = match artifact.source() {
             ArtifactSource::Path(path) => {
                 if !path.exists() {
                     bail!("WASM file does not exist: {}", path.display());
@@ -290,23 +297,36 @@ impl PitRuntime {
                 if !path.is_file() {
                     bail!("WASM path is not a file: {}", path.display());
                 }
-                Module::from_file(&self.engine, path).with_context(|| {
-                    format!(
-                        "WASM compilation failed for '{}'; expected a valid WASI Preview 1 module",
-                        path.display()
-                    )
-                })?
+                std::fs::read(path)
+                    .with_context(|| format!("failed to read WASM artifact {}", path.display()))?
             }
-            ArtifactSource::Bytes(bytes) => Module::from_binary(&self.engine, bytes).with_context(|| {
-                format!(
-                    "WASM compilation failed for artifact '{}'; expected a valid WASI Preview 1 module",
-                    artifact.id
-                )
-            })?,
+            ArtifactSource::Bytes(bytes) => bytes.to_vec(),
+        };
+        let format = detect_format(&bytes)?;
+        let (module, p1_linker, component, p2_linker) = match format {
+            ArtifactFormat::CoreModule => (
+                Some(
+                    Module::from_binary(&self.engine, &bytes)
+                        .context("WASM module preparation failed")?,
+                ),
+                Some(core_linker(&self.engine)?),
+                None,
+                None,
+            ),
+            ArtifactFormat::Component => {
+                let component = Component::new(&self.engine, &bytes)
+                    .context("WASM component preparation failed")?;
+                let mut linker = ComponentLinker::new(&self.engine);
+                add_to_linker_sync(&mut linker).context("failed to link WASI Preview 2")?;
+                (None, None, Some(component), Some(linker))
+            }
         };
         Ok(PreparedArtifact {
             engine: self.engine.clone(),
             module,
+            p1_linker,
+            component,
+            p2_linker,
             artifact,
             ticker: Arc::clone(&self.ticker),
         })
@@ -321,7 +341,10 @@ impl PitRuntime {
 #[derive(Clone)]
 pub struct PreparedArtifact {
     engine: Engine,
-    module: Module,
+    module: Option<Module>,
+    p1_linker: Option<CoreLinker<HostState>>,
+    component: Option<Component>,
+    p2_linker: Option<ComponentLinker<P2HostState>>,
     artifact: WasmArtifact,
     ticker: Arc<EpochTicker>,
 }
@@ -329,6 +352,61 @@ pub struct PreparedArtifact {
 impl PreparedArtifact {
     pub fn artifact(&self) -> &WasmArtifact {
         &self.artifact
+    }
+
+    pub fn default_entrypoint(&self) -> &'static str {
+        if self.component.is_some() {
+            pit_artifact::WASI_PREVIEW2_ENTRYPOINT
+        } else {
+            pit_artifact::WASI_PREVIEW1_ENTRYPOINT
+        }
+    }
+
+    /// Measures isolated Store/instance creation without invoking the guest.
+    /// The result intentionally includes linker lookup work for the P1 path.
+    pub fn measure_instantiation(&self, request: &ExecutionRequest) -> Result<Duration> {
+        request.validate()?;
+        if request.artifact.id() != self.artifact.id() {
+            bail!("execution request artifact does not match prepared artifact");
+        }
+        let mut args = Vec::with_capacity(request.args.len() + 1);
+        args.push(request.artifact.program_name());
+        args.extend(request.args.iter().cloned());
+        let started = Instant::now();
+        if let (Some(component), Some(linker)) = (&self.component, &self.p2_linker) {
+            let mut builder = WasiCtxBuilder::new();
+            builder.args(&args).envs(&request.env);
+            let mut store = Store::new(
+                &self.engine,
+                P2HostState {
+                    wasi: builder.build(),
+                    table: ResourceTable::new(),
+                    limits: RuntimeLimiter::new(request.limits.memory_bytes),
+                },
+            );
+            store.limiter(|state| &mut state.limits);
+            let _command = Command::instantiate(&mut store, component, linker)?;
+        } else {
+            let stdout = CapturedOutput::new();
+            let stderr = CapturedOutput::new();
+            let mut builder = WasiCtxBuilder::new();
+            builder.args(&args).envs(&request.env);
+            builder.stdout(stdout).stderr(stderr);
+            let mut store = Store::new(
+                &self.engine,
+                HostState {
+                    wasi: builder.build_p1(),
+                    limits: RuntimeLimiter::new(request.limits.memory_bytes),
+                },
+            );
+            store.limiter(|state| &mut state.limits);
+            let _instance = self
+                .p1_linker
+                .as_ref()
+                .unwrap()
+                .instantiate(&mut store, self.module.as_ref().unwrap())?;
+        }
+        Ok(started.elapsed())
     }
 
     pub fn execute(
@@ -343,6 +421,16 @@ impl PreparedArtifact {
                 request.artifact.id(),
                 self.artifact.id()
             );
+        }
+        if self.component.is_some() {
+            if request.entrypoint != pit_artifact::WASI_PREVIEW2_ENTRYPOINT {
+                bail!(
+                    "unsupported WASI Preview 2 entrypoint '{}'; expected {}",
+                    request.entrypoint,
+                    pit_artifact::WASI_PREVIEW2_ENTRYPOINT
+                );
+            }
+            return self.execute_p2(request, cancellation);
         }
         // Keep the shared epoch ticker alive for every prepared artifact.
         let _ = &self.ticker;
@@ -382,11 +470,12 @@ impl PreparedArtifact {
             Ok(UpdateDeadline::Continue(1))
         });
 
-        let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)
-            .context("failed to link WASI Preview 1 imports")?;
-
-        let call_result = match linker.instantiate(&mut store, &self.module) {
+        let call_result = match self
+            .p1_linker
+            .as_ref()
+            .unwrap()
+            .instantiate(&mut store, self.module.as_ref().unwrap())
+        {
             Ok(instance) => {
                 match instance.get_typed_func::<(), ()>(&mut store, &request.entrypoint) {
                     Ok(start) => start.call(&mut store, ()),
@@ -511,6 +600,188 @@ impl PreparedArtifact {
             error,
         }
     }
+
+    fn execute_p2(
+        &self,
+        request: &ExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<RuntimeExecutionResult> {
+        let started = SystemTime::now();
+        let timer = Instant::now();
+        let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(usize::MAX);
+        let stderr = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(usize::MAX);
+        let mut args = Vec::with_capacity(request.args.len() + 1);
+        args.push(request.artifact.program_name());
+        args.extend(request.args.iter().cloned());
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder.args(&args).envs(&request.env);
+        wasi_builder.stdout(stdout.clone()).stderr(stderr.clone());
+        let mut store = Store::new(
+            &self.engine,
+            P2HostState {
+                wasi: wasi_builder.build(),
+                table: ResourceTable::new(),
+                limits: RuntimeLimiter::new(request.limits.memory_bytes),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        let control = Arc::new(ExecutionControl::new(cancellation, request.limits.timeout));
+        let callback_control = Arc::clone(&control);
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            if callback_control.token.is_cancelled() {
+                callback_control
+                    .signal
+                    .store(ControlSignal::Cancelled as u8, Ordering::Release);
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            if callback_control.timed_out() {
+                callback_control
+                    .signal
+                    .store(ControlSignal::TimedOut as u8, Ordering::Release);
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+
+        let call_result = match Command::instantiate(
+            &mut store,
+            self.component.as_ref().unwrap(),
+            self.p2_linker.as_ref().unwrap(),
+        ) {
+            Ok(command) => command.wasi_cli_run().call_run(&mut store),
+            Err(error) => {
+                return Ok(Self::result_p2(
+                    status_for_p2_error(&store, &control),
+                    None,
+                    &stdout.contents(),
+                    &stderr.contents(),
+                    started,
+                    timer.elapsed(),
+                    Some(error.to_string()),
+                ));
+            }
+        };
+        let stdout_bytes = stdout.contents();
+        let stderr_bytes = stderr.contents();
+        let status = control.signal();
+        let memory_exceeded = store.data().limits.memory_exceeded;
+        let result = match status {
+            ControlSignal::TimedOut => Self::result_p2(
+                ExecutionStatus::TimedOut,
+                None,
+                &stdout_bytes,
+                &stderr_bytes,
+                started,
+                timer.elapsed(),
+                Some("execution exceeded its timeout".to_owned()),
+            ),
+            ControlSignal::Cancelled => Self::result_p2(
+                ExecutionStatus::Cancelled,
+                None,
+                &stdout_bytes,
+                &stderr_bytes,
+                started,
+                timer.elapsed(),
+                Some("execution was cancelled".to_owned()),
+            ),
+            ControlSignal::None if memory_exceeded => Self::result_p2(
+                ExecutionStatus::MemoryLimitExceeded,
+                None,
+                &stdout_bytes,
+                &stderr_bytes,
+                started,
+                timer.elapsed(),
+                Some("execution exceeded its memory limit".to_owned()),
+            ),
+            ControlSignal::None => match call_result {
+                Ok(Ok(())) => Self::result_p2(
+                    ExecutionStatus::Completed,
+                    Some(0),
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    started,
+                    timer.elapsed(),
+                    None,
+                ),
+                Ok(Err(())) => Self::result_p2(
+                    ExecutionStatus::GuestExitNonZero,
+                    Some(1),
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    started,
+                    timer.elapsed(),
+                    Some("guest exited with a non-zero status".to_owned()),
+                ),
+                Err(error) => {
+                    if let Some(exit_code) = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<I32Exit>().map(|exit| exit.0))
+                    {
+                        Self::result_p2(
+                            if exit_code == 0 {
+                                ExecutionStatus::Completed
+                            } else {
+                                ExecutionStatus::GuestExitNonZero
+                            },
+                            Some(exit_code),
+                            &stdout_bytes,
+                            &stderr_bytes,
+                            started,
+                            timer.elapsed(),
+                            (exit_code != 0).then(|| error.to_string()),
+                        )
+                    } else {
+                        Self::result_p2(
+                            ExecutionStatus::GuestTrap,
+                            None,
+                            &stdout_bytes,
+                            &stderr_bytes,
+                            started,
+                            timer.elapsed(),
+                            Some(error.to_string()),
+                        )
+                    }
+                }
+            },
+        };
+        Ok(result)
+    }
+
+    fn result_p2(
+        status: ExecutionStatus,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+        started: SystemTime,
+        duration: Duration,
+        error: Option<String>,
+    ) -> RuntimeExecutionResult {
+        RuntimeExecutionResult {
+            status,
+            exit_code,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            duration,
+            started,
+            error,
+        }
+    }
+}
+
+struct P2HostState {
+    wasi: WasiCtx,
+    table: ResourceTable,
+    limits: RuntimeLimiter,
+}
+
+impl WasiView for P2HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
 }
 
 struct HostState {
@@ -569,6 +840,36 @@ fn status_for_error(store: &Store<HostState>, control: &ExecutionControl) -> Exe
         }
         ControlSignal::None => ExecutionStatus::RuntimeError,
     }
+}
+
+fn status_for_p2_error(store: &Store<P2HostState>, control: &ExecutionControl) -> ExecutionStatus {
+    match control.signal() {
+        ControlSignal::TimedOut => ExecutionStatus::TimedOut,
+        ControlSignal::Cancelled => ExecutionStatus::Cancelled,
+        ControlSignal::None if store.data().limits.memory_exceeded => {
+            ExecutionStatus::MemoryLimitExceeded
+        }
+        ControlSignal::None => ExecutionStatus::RuntimeError,
+    }
+}
+
+fn detect_format(bytes: &[u8]) -> Result<ArtifactFormat> {
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::Version { encoding, .. } = payload? {
+            return Ok(match encoding {
+                Encoding::Module => ArtifactFormat::CoreModule,
+                Encoding::Component => ArtifactFormat::Component,
+            });
+        }
+    }
+    bail!("invalid WebAssembly artifact")
+}
+
+fn core_linker(engine: &Engine) -> Result<CoreLinker<HostState>> {
+    let mut linker = CoreLinker::new(engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)
+        .context("failed to link WASI Preview 1 imports")?;
+    Ok(linker)
 }
 
 struct ExecutionControl {
