@@ -1,28 +1,86 @@
 //! Bounded local scheduling for independent PitFast executions.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 
+/// Monotonic invocation identifier local to one scheduler process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecutionId(pub u64);
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:04}", self.0 + 1)
+    }
+}
+
+/// Zero-based host execution-lane identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaneId(pub usize);
+
+impl fmt::Display for LaneId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// A host CPU execution lane owned by a local scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionLane {
     /// Zero-based lane identifier.
-    pub id: usize,
+    pub id: LaneId,
+}
+
+/// Logical state of one execution lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    /// The lane can accept another execution.
+    Free,
+    /// The lane is currently running the specified execution.
+    Running { execution_id: ExecutionId },
+}
+
+/// Lightweight lifecycle events emitted by one scheduler run.
+#[derive(Debug, Clone)]
+pub enum ExecutionEvent {
+    /// An invocation entered the scheduler's queue.
+    Queued { execution_id: ExecutionId },
+    /// An invocation was assigned to a lane and started.
+    Started {
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        queued_for: Duration,
+    },
+    /// An invocation completed successfully.
+    Completed {
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        duration: Duration,
+    },
+    /// An invocation failed and released its lane.
+    Failed {
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        duration: Duration,
+        error: String,
+    },
 }
 
 /// Basic lifecycle information for one scheduled execution.
 #[derive(Debug, Clone)]
 pub struct ExecutionReport {
-    /// Zero-based invocation identifier.
-    pub execution_id: usize,
+    /// Monotonic invocation identifier.
+    pub execution_id: ExecutionId,
     /// Lane that performed the invocation.
-    pub lane_id: usize,
+    pub lane_id: LaneId,
     /// Host timestamp immediately before the invocation started.
     pub started: SystemTime,
+    /// Time spent waiting in the scheduler queue before starting.
+    pub queued_for: Duration,
     /// Wall-clock time spent in the invocation.
     pub duration: Duration,
     /// Whether the invocation returned successfully.
@@ -38,10 +96,87 @@ pub struct ExecutionResult<T> {
     pub value: Option<T>,
 }
 
+/// Observable scheduler state after or during a run.
+#[derive(Debug, Clone)]
+pub struct SchedulerSnapshot {
+    pub lane_count: usize,
+    pub running: usize,
+    pub queued: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub peak_active: usize,
+    pub lanes: Vec<LaneState>,
+}
+
+/// Results, events, and final state from one scheduler run.
+#[derive(Debug)]
+pub struct SchedulerRun<T> {
+    pub results: Vec<ExecutionResult<T>>,
+    pub events: Vec<ExecutionEvent>,
+    pub snapshot: SchedulerSnapshot,
+}
+
+struct RunState {
+    queued: AtomicUsize,
+    running: AtomicUsize,
+    completed: AtomicUsize,
+    failed: AtomicUsize,
+    peak_active: AtomicUsize,
+    lanes: Vec<Mutex<LaneState>>,
+    events: Mutex<Vec<ExecutionEvent>>,
+}
+
+impl RunState {
+    fn new(lane_count: usize, queued: usize) -> Self {
+        Self {
+            queued: AtomicUsize::new(queued),
+            running: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            peak_active: AtomicUsize::new(0),
+            lanes: (0..lane_count)
+                .map(|_| Mutex::new(LaneState::Free))
+                .collect(),
+            events: Mutex::new(Vec::with_capacity(queued.saturating_mul(3))),
+        }
+    }
+
+    fn push_event(&self, event: ExecutionEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+    }
+
+    fn set_lane(&self, lane_id: LaneId, state: LaneState) {
+        *self.lanes[lane_id.0]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    fn snapshot(&self, lane_count: usize) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            lane_count,
+            running: self.running.load(Ordering::Acquire),
+            queued: self.queued.load(Ordering::Acquire),
+            completed: self.completed.load(Ordering::Acquire),
+            failed: self.failed.load(Ordering::Acquire),
+            peak_active: self.peak_active.load(Ordering::Acquire),
+            lanes: self
+                .lanes
+                .iter()
+                .map(|lane| *lane.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+                .collect(),
+        }
+    }
+}
+
 /// A bounded scheduler that uses one worker thread per execution lane.
 #[derive(Debug, Clone)]
 pub struct PitScheduler {
     lanes: Arc<[ExecutionLane]>,
+    next_execution_id: Arc<AtomicU64>,
+    run_lock: Arc<Mutex<()>>,
 }
 
 impl PitScheduler {
@@ -52,10 +187,14 @@ impl PitScheduler {
         }
 
         let lanes = (0..lane_count)
-            .map(|id| ExecutionLane { id })
+            .map(|id| ExecutionLane { id: LaneId(id) })
             .collect::<Vec<_>>()
             .into();
-        Ok(Self { lanes })
+        Ok(Self {
+            lanes,
+            next_execution_id: Arc::new(AtomicU64::new(0)),
+            run_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Creates a scheduler using the host's detected parallelism.
@@ -64,10 +203,14 @@ impl PitScheduler {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         let lanes = (0..lane_count)
-            .map(|id| ExecutionLane { id })
+            .map(|id| ExecutionLane { id: LaneId(id) })
             .collect::<Vec<_>>()
             .into();
-        Self { lanes }
+        Self {
+            lanes,
+            next_execution_id: Arc::new(AtomicU64::new(0)),
+            run_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Returns the number of simultaneously available execution lanes.
@@ -80,18 +223,40 @@ impl PitScheduler {
         &self.lanes
     }
 
-    /// Runs `count` independent jobs, bounded by the scheduler's lane count.
+    /// Runs `count` jobs and returns results plus lifecycle telemetry.
     ///
     /// Excess jobs remain queued behind the atomic work cursor. A worker takes
     /// another job as soon as its previous job finishes; no busy waiting or
-    /// process creation is involved.
-    pub fn run_many<T, F>(&self, count: usize, task: F) -> Result<Vec<ExecutionResult<T>>>
+    /// process creation is involved. At most one worker owns a lane, so a lane
+    /// cannot contain two active executions.
+    pub fn run_many_detailed<T, F>(&self, count: usize, task: F) -> Result<SchedulerRun<T>>
     where
         T: Send + 'static,
-        F: Fn(usize, usize) -> Result<T> + Send + Sync + 'static,
+        F: Fn(ExecutionId, LaneId) -> Result<T> + Send + Sync + 'static,
     {
         if count == 0 {
             bail!("execution count must be greater than zero");
+        }
+
+        // A scheduler owns its lanes. Serializing batches on the same scheduler
+        // prevents two callers from creating overlapping workers for one lane
+        // set while preserving multicore execution inside each batch.
+        let _run_guard = self
+            .run_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let run_state = Arc::new(RunState::new(self.lane_count(), count));
+        let execution_ids: Arc<[ExecutionId]> = (0..count)
+            .map(|_| ExecutionId(self.next_execution_id.fetch_add(1, Ordering::Relaxed)))
+            .collect::<Vec<_>>()
+            .into();
+        let queued_at: Arc<[Instant]> = (0..count)
+            .map(|_| Instant::now())
+            .collect::<Vec<_>>()
+            .into();
+        for execution_id in execution_ids.iter().copied() {
+            run_state.push_event(ExecutionEvent::Queued { execution_id });
         }
 
         let next_execution = Arc::new(AtomicUsize::new(0));
@@ -103,12 +268,27 @@ impl PitScheduler {
                 let next_execution = Arc::clone(&next_execution);
                 let task = Arc::clone(&task);
                 let results = Arc::clone(&results);
+                let run_state = Arc::clone(&run_state);
+                let execution_ids = Arc::clone(&execution_ids);
+                let queued_at = Arc::clone(&queued_at);
                 scope.spawn(move || {
                     loop {
-                        let execution_id = next_execution.fetch_add(1, Ordering::Relaxed);
-                        if execution_id >= count {
+                        let work_index = next_execution.fetch_add(1, Ordering::Relaxed);
+                        if work_index >= count {
                             break;
                         }
+
+                        let execution_id = execution_ids[work_index];
+                        run_state.queued.fetch_sub(1, Ordering::AcqRel);
+                        run_state.set_lane(lane.id, LaneState::Running { execution_id });
+                        let active = run_state.running.fetch_add(1, Ordering::AcqRel) + 1;
+                        run_state.peak_active.fetch_max(active, Ordering::AcqRel);
+                        let queued_for = queued_at[work_index].elapsed();
+                        run_state.push_event(ExecutionEvent::Started {
+                            execution_id,
+                            lane_id: lane.id,
+                            queued_for,
+                        });
 
                         let started = SystemTime::now();
                         let timer = Instant::now();
@@ -123,13 +303,32 @@ impl PitScheduler {
                             execution_id,
                             lane_id: lane.id,
                             started,
+                            queued_for,
                             duration,
                             success,
-                            error,
+                            error: error.clone(),
                         };
+                        if success {
+                            run_state.completed.fetch_add(1, Ordering::AcqRel);
+                            run_state.push_event(ExecutionEvent::Completed {
+                                execution_id,
+                                lane_id: lane.id,
+                                duration,
+                            });
+                        } else {
+                            run_state.failed.fetch_add(1, Ordering::AcqRel);
+                            run_state.push_event(ExecutionEvent::Failed {
+                                execution_id,
+                                lane_id: lane.id,
+                                duration,
+                                error: error.unwrap_or_else(|| "unknown error".to_owned()),
+                            });
+                        }
+                        run_state.running.fetch_sub(1, Ordering::AcqRel);
+                        run_state.set_lane(lane.id, LaneState::Free);
                         tracing::debug!(
-                            execution_id,
-                            lane_id = lane.id,
+                            execution_id = execution_id.0,
+                            lane_id = lane.id.0,
                             success,
                             duration_ms = duration.as_secs_f64() * 1000.0,
                             "execution completed"
@@ -148,13 +347,34 @@ impl PitScheduler {
             .into_inner()
             .map_err(|_| anyhow!("scheduler result lock is poisoned"))?;
         results.sort_unstable_by_key(|result| result.report.execution_id);
-        Ok(results)
+        let snapshot = run_state.snapshot(self.lane_count());
+        let events = Arc::try_unwrap(run_state)
+            .map_err(|_| anyhow!("scheduler workers did not release run state"))?
+            .events
+            .into_inner()
+            .map_err(|_| anyhow!("scheduler event lock is poisoned"))?;
+
+        Ok(SchedulerRun {
+            results,
+            events,
+            snapshot,
+        })
+    }
+
+    /// Runs jobs and returns only their execution results.
+    pub fn run_many<T, F>(&self, count: usize, task: F) -> Result<Vec<ExecutionResult<T>>>
+    where
+        T: Send + 'static,
+        F: Fn(ExecutionId, LaneId) -> Result<T> + Send + Sync + 'static,
+    {
+        Ok(self.run_many_detailed(count, task)?.results)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PitScheduler;
+    use super::{ExecutionEvent, ExecutionId, LaneState, PitScheduler};
+    use anyhow::anyhow;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -177,24 +397,40 @@ mod tests {
     }
 
     #[test]
-    fn completes_requested_task_count() {
+    fn completes_requested_task_count_and_emits_queue_events() {
         let scheduler = PitScheduler::new(2).expect("two lanes are valid");
-        let results = scheduler
-            .run_many(25, |execution_id, _| Ok(execution_id))
+        let run = scheduler
+            .run_many_detailed(25, |execution_id, _| Ok(execution_id))
             .expect("jobs should complete");
-        assert_eq!(results.len(), 25);
-        assert!(results.iter().all(|result| result.report.success));
+        assert_eq!(run.results.len(), 25);
+        assert_eq!(run.snapshot.completed, 25);
+        assert_eq!(run.snapshot.failed, 0);
+        assert_eq!(run.snapshot.queued, 0);
+        assert_eq!(run.snapshot.running, 0);
+        assert!(
+            run.events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::Queued { .. }))
+                .count()
+                == 25
+        );
+        assert!(
+            run.snapshot
+                .lanes
+                .iter()
+                .all(|state| *state == LaneState::Free)
+        );
     }
 
     #[test]
-    fn never_exceeds_lane_count() {
+    fn never_exceeds_lane_count_and_reuses_lanes() {
         let scheduler = PitScheduler::new(3).expect("three lanes are valid");
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let active_for_task = Arc::clone(&active);
         let peak_for_task = Arc::clone(&peak);
-        let results = scheduler
-            .run_many(18, move |_, _| {
+        let run = scheduler
+            .run_many_detailed(18, move |_, _| {
                 let current = active_for_task.fetch_add(1, Ordering::SeqCst) + 1;
                 peak_for_task.fetch_max(current, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(5));
@@ -203,8 +439,56 @@ mod tests {
             })
             .expect("jobs should complete");
 
-        assert_eq!(results.len(), 18);
+        assert_eq!(run.results.len(), 18);
         assert!(peak.load(Ordering::SeqCst) <= scheduler.lane_count());
-        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert_eq!(peak.load(Ordering::SeqCst), scheduler.lane_count());
+        assert_eq!(run.snapshot.running, 0);
+        assert!(
+            run.snapshot
+                .lanes
+                .iter()
+                .all(|state| *state == LaneState::Free)
+        );
+    }
+
+    #[test]
+    fn failure_releases_lane_and_allows_queued_work_to_finish() {
+        let scheduler = PitScheduler::new(2).expect("two lanes are valid");
+        let run = scheduler
+            .run_many_detailed(12, |execution_id, _| {
+                if execution_id == ExecutionId(0) {
+                    Err(anyhow!("intentional failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("scheduler should return failed results");
+
+        assert_eq!(run.results.len(), 12);
+        assert_eq!(run.snapshot.completed, 11);
+        assert_eq!(run.snapshot.failed, 1);
+        assert_eq!(run.snapshot.running, 0);
+        assert!(
+            run.snapshot
+                .lanes
+                .iter()
+                .all(|state| *state == LaneState::Free)
+        );
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Failed { error, .. } if error.contains("intentional failure")
+        )));
+    }
+
+    #[test]
+    fn execution_ids_are_monotonic_across_runs() {
+        let scheduler = PitScheduler::new(1).expect("one lane is valid");
+        let first = scheduler
+            .run_many(1, |execution_id, _| Ok(execution_id))
+            .expect("first run should complete");
+        let second = scheduler
+            .run_many(1, |execution_id, _| Ok(execution_id))
+            .expect("second run should complete");
+        assert!(second[0].report.execution_id > first[0].report.execution_id);
     }
 }
