@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "apps/pit",
+    "apps/pit-node",
+    "crates/pit-runtime",
+    "crates/pit-scheduler",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wasmtime = "39.0"
+wasmtime-wasi = "39.0"
