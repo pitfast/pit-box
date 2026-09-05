@@ -1,7 +1,7 @@
 //! CLI-independent composition of the PitFast runtime and scheduler.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
@@ -100,7 +100,7 @@ pub struct PitNode {
 pub struct PitHttpDispatcher {
     runtime: PitRuntime,
     scheduler: PitScheduler,
-    artifacts: std::collections::HashMap<String, Arc<PreparedArtifact>>,
+    artifacts: RwLock<std::collections::HashMap<String, Arc<PreparedArtifact>>>,
 }
 
 #[derive(Debug)]
@@ -118,7 +118,7 @@ impl PitHttpDispatcher {
         Ok(Self {
             runtime: PitRuntime::new()?,
             scheduler: PitScheduler::local(),
-            artifacts: std::collections::HashMap::new(),
+            artifacts: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -130,9 +130,12 @@ impl PitHttpDispatcher {
         self.scheduler.shared_peak_active()
     }
 
-    pub fn register(&mut self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
+    pub fn register(&self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
         let prepared = self.runtime.prepare_http(artifact)?;
-        self.artifacts.insert(key.into(), Arc::new(prepared));
+        self.artifacts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.into(), Arc::new(prepared));
         Ok(())
     }
 
@@ -157,6 +160,8 @@ impl PitHttpDispatcher {
     ) -> Result<HttpDispatchResult> {
         let prepared = self
             .artifacts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
@@ -198,7 +203,10 @@ impl PitHttpDispatcher {
     ) -> Result<HttpResponse> {
         let prepared = self
             .artifacts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
+            .cloned()
             .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
         prepared.execute_http_with_invoker(
             &request,
