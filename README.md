@@ -30,6 +30,21 @@ PitFast concurrency means running independent WASM invocations concurrently. It
 does not magically parallelize one sequential WASM invocation; multicore
 utilization comes from having multiple isolated executions active at once.
 
+## PitFast pit-box responsibilities
+
+pit-box is the safe local WASM execution system. It validates an execution
+request, prepares and reuses a compiled artifact, schedules isolated Stores,
+enforces execution limits, and returns structured results.
+
+pit-box is not the PitCrew builder, a cluster controller, a load balancer, or a
+container runtime. PitCrew will eventually turn source code into standardized
+artifacts; this repository executes already-built WASI Preview 1 modules.
+
+Each request can provide guest arguments, explicit environment variables,
+captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host
+environment inheritance, stdin inheritance, filesystem exposure, and network
+exposure are disabled by default.
+
 ## Quick start
 
 Build the workspace:
@@ -44,6 +59,10 @@ Build the example modules (once):
 rustup target add wasm32-wasip1
 rustc --target wasm32-wasip1 -O examples/hello/src/main.rs -o examples/hello.wasm
 rustc --target wasm32-wasip1 -O examples/cpu-burn/src/main.rs -o examples/cpu-burn.wasm
+rustc --target wasm32-wasip1 -O examples/env/src/main.rs -o examples/env.wasm
+rustc --target wasm32-wasip1 -O examples/infinite-loop/src/main.rs -o examples/infinite-loop.wasm
+rustc --target wasm32-wasip1 -O examples/memory-grow/src/main.rs -o examples/memory-grow.wasm
+rustc --target wasm32-wasip1 -O examples/exit/src/main.rs -o examples/exit.wasm
 ~~~
 
 Inspect the local execution hardware:
@@ -57,6 +76,10 @@ Run one or many independent invocations:
 ~~~bash
 cargo run -p pit -- run ./examples/hello.wasm
 cargo run -p pit -- run ./examples/hello.wasm --concurrency 100
+cargo run -p pit -- run ./examples/hello.wasm -- hello world
+cargo run -p pit -- run ./examples/env.wasm --env MODE=production --env REGION=jakarta
+cargo run -p pit -- run ./examples/infinite-loop.wasm --timeout 500ms
+cargo run -p pit -- run ./examples/memory-grow.wasm --memory 8MiB
 ~~~
 
 Run the CPU-bound benchmark with release optimizations:

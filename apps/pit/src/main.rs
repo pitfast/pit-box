@@ -3,8 +3,10 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use pit_node::{NodeRunReport, PitNode};
-use pit_scheduler::{ExecutionEvent, ExecutionReport, PitScheduler};
+use pit_node::{
+    ExecutionLimits, ExecutionRequest, ExecutionResult, ExecutionStatus, PitNode, WasmArtifact,
+};
+use pit_scheduler::{ExecutionEvent, PitScheduler};
 
 #[derive(Debug, Parser)]
 #[command(name = "pit", about = "PitFast local WebAssembly execution")]
@@ -19,14 +21,24 @@ enum Command {
     Run {
         /// Path to the WASM module.
         wasm_file: PathBuf,
-
         /// Number of independent invocations.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
-
-        /// Print queued, started, and completed execution events.
+        /// Explicit guest environment variable in KEY=VALUE form.
+        #[arg(long, value_parser = parse_env)]
+        env: Vec<(String, String)>,
+        /// Stop guest execution after this duration, for example 500ms or 2s.
+        #[arg(long, value_parser = parse_duration)]
+        timeout: Option<Duration>,
+        /// Limit each guest linear memory, for example 64MiB.
+        #[arg(long, value_parser = parse_memory)]
+        memory: Option<usize>,
+        /// Print queued, started, completed, and failed execution events.
         #[arg(short, long)]
         verbose: bool,
+        /// Arguments passed to the guest after the conventional separator.
+        #[arg(last = true)]
+        guest_args: Vec<String>,
     },
     /// Run a release-oriented local concurrency benchmark.
     Bench {
@@ -52,8 +64,20 @@ fn main() -> Result<()> {
         Command::Run {
             wasm_file,
             concurrency,
+            env,
+            timeout,
+            memory,
             verbose,
-        } => run(wasm_file, concurrency, verbose),
+            guest_args,
+        } => run(
+            wasm_file,
+            concurrency,
+            env,
+            timeout,
+            memory,
+            guest_args,
+            verbose,
+        ),
         Command::Bench { wasm_file } => benchmark(wasm_file),
     }
 }
@@ -68,21 +92,42 @@ fn print_system() -> Result<()> {
     Ok(())
 }
 
-fn run(wasm_file: PathBuf, concurrency: usize, verbose: bool) -> Result<()> {
+fn run(
+    wasm_file: PathBuf,
+    concurrency: usize,
+    env: Vec<(String, String)>,
+    timeout: Option<Duration>,
+    memory: Option<usize>,
+    guest_args: Vec<String>,
+    verbose: bool,
+) -> Result<()> {
     if concurrency == 0 {
         bail!("concurrency must be greater than zero");
     }
 
-    let node = PitNode::from_file(&wasm_file)?;
-    let report = node.run(concurrency)?;
+    let artifact = WasmArtifact::from_path(&wasm_file);
+    let request = ExecutionRequest::new(artifact.clone())
+        .with_args(guest_args)
+        .with_env(env)
+        .with_limits(ExecutionLimits {
+            timeout,
+            memory_bytes: memory,
+        });
+    let node = PitNode::from_artifact(artifact)?;
+    let report = node.execute_many(request, concurrency)?;
+
     if verbose {
         print_events(&report.events);
+        print_selected_output(&report.executions);
         println!();
+    } else if report.requested == 1 {
+        print_single_output(&report.executions);
     }
+
     print_run_summary(&report);
-    if report.failed > 0 {
+    if report.completed != report.requested {
         print_failures(&report.executions);
-        bail!("one or more WASM executions failed");
+        bail!("one or more WASM executions did not complete successfully");
     }
     Ok(())
 }
@@ -118,12 +163,11 @@ fn benchmark(wasm_file: PathBuf) -> Result<()> {
             format_duration(timing.p99),
             report.peak_active,
         );
-        if report.failed > 0 {
+        if report.completed != report.requested {
             print_failures(&report.executions);
             bail!("benchmark execution failed at concurrency {concurrency}");
         }
     }
-
     Ok(())
 }
 
@@ -147,7 +191,7 @@ fn benchmark_levels(lanes: usize) -> Vec<usize> {
     levels
 }
 
-fn print_run_summary(report: &NodeRunReport) {
+fn print_run_summary(report: &pit_node::NodeRunReport) {
     let timing = TimingSummary::from_reports(&report.executions);
     println!("PitFast Pit Box");
     println!();
@@ -160,6 +204,9 @@ fn print_run_summary(report: &NodeRunReport) {
     println!("  Requested: {}", report.requested);
     println!("  Completed: {}", report.completed);
     println!("  Failed: {}", report.failed);
+    println!("  Timed Out: {}", report.timed_out);
+    println!("  Cancelled: {}", report.cancelled);
+    println!("  Memory Limit: {}", report.memory_limit_exceeded);
     println!("  Peak Active: {}", report.peak_active);
     println!();
     println!("Timing");
@@ -168,6 +215,48 @@ fn print_run_summary(report: &NodeRunReport) {
     println!("  p50: {}", format_duration(timing.p50));
     println!("  p95: {}", format_duration(timing.p95));
     println!("  p99: {}", format_duration(timing.p99));
+}
+
+fn print_single_output(executions: &[ExecutionResult]) {
+    if let Some(execution) = executions.first() {
+        println!("Execution: {}", execution.execution_id);
+        println!("Lane: {}", execution.lane_id);
+        println!("Status: {}", execution.status);
+        println!(
+            "Exit Code: {}",
+            execution
+                .exit_code
+                .map_or_else(|| "-".to_owned(), |code| code.to_string())
+        );
+        println!("Duration: {}", format_duration(execution.duration));
+        print_output_block("stdout", &execution.stdout);
+        print_output_block("stderr", &execution.stderr);
+        println!();
+    }
+}
+
+fn print_selected_output(executions: &[ExecutionResult]) {
+    for execution in executions
+        .iter()
+        .filter(|execution| !execution.stdout.is_empty() || !execution.stderr.is_empty())
+        .take(5)
+    {
+        println!("BOX {} OUTPUT", execution.execution_id);
+        print_output_block("stdout", &execution.stdout);
+        print_output_block("stderr", &execution.stderr);
+    }
+}
+
+fn print_output_block(label: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    println!("{label}:");
+    let output = String::from_utf8_lossy(bytes);
+    print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
 }
 
 fn print_events(events: &[ExecutionEvent]) {
@@ -211,19 +300,75 @@ fn print_events(events: &[ExecutionEvent]) {
     }
 }
 
-fn print_failures(executions: &[ExecutionReport]) {
+fn print_failures(executions: &[ExecutionResult]) {
     for execution in executions
         .iter()
-        .filter(|execution| !execution.success)
+        .filter(|execution| execution.status != ExecutionStatus::Completed)
         .take(5)
     {
         eprintln!(
-            "execution {} failed on lane {}: {}",
+            "execution {} on lane {}: status={}, exit_code={}, error={}",
             execution.execution_id,
             execution.lane_id,
-            execution.error.as_deref().unwrap_or("unknown error")
+            execution.status,
+            execution
+                .exit_code
+                .map_or_else(|| "-".to_owned(), |code| code.to_string()),
+            execution.error.as_deref().unwrap_or("none")
         );
     }
+}
+
+fn parse_env(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "environment entry must use KEY=VALUE".to_owned())?;
+    if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
+        return Err("environment entry has an invalid name or NUL byte".to_owned());
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let (number, unit) = if let Some(number) = value.strip_suffix("ms") {
+        (number, "ms")
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, "s")
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, "m")
+    } else {
+        return Err("duration must use ms, s, or m (for example 500ms)".to_owned());
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "duration value must be a non-negative integer".to_owned())?;
+    match unit {
+        "ms" => Ok(Duration::from_millis(number)),
+        "s" => Ok(Duration::from_secs(number)),
+        "m" => number
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| "duration is too large".to_owned()),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_memory(value: &str) -> Result<usize, String> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("KiB") {
+        (number, 1024_usize)
+    } else if let Some(number) = value.strip_suffix("MiB") {
+        (number, 1024_usize.pow(2))
+    } else if let Some(number) = value.strip_suffix("GiB") {
+        (number, 1024_usize.pow(3))
+    } else {
+        return Err("memory must use KiB, MiB, or GiB (for example 64MiB)".to_owned());
+    };
+    let number = number
+        .parse::<usize>()
+        .map_err(|_| "memory value must be a non-negative integer".to_owned())?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "memory limit is too large".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -235,7 +380,7 @@ struct TimingSummary {
 }
 
 impl TimingSummary {
-    fn from_reports(reports: &[ExecutionReport]) -> Self {
+    fn from_reports(reports: &[ExecutionResult]) -> Self {
         let mut durations = reports
             .iter()
             .map(|report| report.duration)
