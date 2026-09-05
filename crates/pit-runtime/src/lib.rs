@@ -99,6 +99,8 @@ pub struct ExecutionLimits {
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
     pub artifact: WasmArtifact,
+    /// WASI entrypoint to invoke. Raw artifacts default to `_start`.
+    pub entrypoint: String,
     /// Arguments after argv[0]. The runtime adds the artifact name as argv[0].
     pub args: Vec<String>,
     /// Only these variables are exposed. Host environment is never inherited.
@@ -110,6 +112,7 @@ impl ExecutionRequest {
     pub fn new(artifact: WasmArtifact) -> Self {
         Self {
             artifact,
+            entrypoint: "_start".to_owned(),
             args: Vec::new(),
             env: Vec::new(),
             limits: ExecutionLimits::default(),
@@ -117,6 +120,9 @@ impl ExecutionRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.entrypoint.is_empty() || self.entrypoint.contains('\0') {
+            bail!("entrypoint must be a non-empty string without NUL bytes");
+        }
         for (index, arg) in self.args.iter().enumerate() {
             if arg.contains('\0') {
                 bail!("argument {index} contains a NUL byte");
@@ -130,6 +136,11 @@ impl ExecutionRequest {
 
     pub fn with_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
         self.args = args.into_iter().collect();
+        self
+    }
+
+    pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
+        self.entrypoint = entrypoint.into();
         self
     }
 
@@ -376,20 +387,22 @@ impl PreparedArtifact {
             .context("failed to link WASI Preview 1 imports")?;
 
         let call_result = match linker.instantiate(&mut store, &self.module) {
-            Ok(instance) => match instance.get_typed_func::<(), ()>(&mut store, "_start") {
-                Ok(start) => start.call(&mut store, ()),
-                Err(error) => {
-                    return Ok(Self::result(
-                        status_for_error(&store, &control),
-                        None,
-                        &stdout,
-                        &stderr,
-                        started,
-                        timer.elapsed(),
-                        Some(error.to_string()),
-                    ));
+            Ok(instance) => {
+                match instance.get_typed_func::<(), ()>(&mut store, &request.entrypoint) {
+                    Ok(start) => start.call(&mut store, ()),
+                    Err(error) => {
+                        return Ok(Self::result(
+                            status_for_error(&store, &control),
+                            None,
+                            &stdout,
+                            &stderr,
+                            started,
+                            timer.elapsed(),
+                            Some(error.to_string()),
+                        ));
+                    }
                 }
-            },
+            }
             Err(error) => {
                 return Ok(Self::result(
                     status_for_error(&store, &control),

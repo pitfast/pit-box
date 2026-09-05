@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
+use pit_artifact::RuntimeSpec;
 use pit_runtime::{PitRuntime, PreparedArtifact, RuntimeExecutionResult};
 use pit_scheduler::{
     ExecutionEvent, ExecutionId, ExecutionReport, LaneId, PitScheduler, SchedulerRun,
@@ -15,6 +16,24 @@ pub use pit_runtime::{
     ArtifactId, ArtifactSource, CancellationToken, ExecutionLimits, ExecutionRequest,
     ExecutionStatus, WasmArtifact, validate_env_entry,
 };
+
+/// Validate a project artifact's runtime contract against this local PitBox.
+pub fn validate_runtime_spec(spec: &RuntimeSpec) -> Result<()> {
+    if !spec.abi.is_supported() {
+        bail!(
+            "unsupported runtime ABI '{}'; this PitBox supports wasi-preview1",
+            spec.abi.as_str()
+        );
+    }
+    if spec.entrypoint != pit_artifact::WASI_PREVIEW1_ENTRYPOINT {
+        bail!(
+            "unsupported WASI Preview 1 entrypoint '{}'; expected {}",
+            spec.entrypoint,
+            pit_artifact::WASI_PREVIEW1_ENTRYPOINT
+        );
+    }
+    Ok(())
+}
 
 /// One isolated execution result with scheduler and runtime identity.
 #[derive(Debug, Clone)]

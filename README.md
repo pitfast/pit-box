@@ -41,6 +41,10 @@ a load balancer, or a container runtime. PitCrew turns source code into
 standardized artifacts; this repository executes already-built WASI Preview 1
 modules.
 
+PitBox currently supports the manifest runtime ABI wasi-preview1 and the
+entrypoint _start when called through the project artifact contract. Raw
+WasmArtifact values remain supported and do not require a .pit directory.
+
 Each request can provide guest arguments, explicit environment variables,
 captured stdout/stderr, a timeout, and a per-Store linear-memory limit. Host
 environment inheritance, stdin inheritance, filesystem exposure, and network

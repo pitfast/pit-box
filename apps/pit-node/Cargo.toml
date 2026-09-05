@@ -8,6 +8,7 @@ description = "Local PitFast execution node"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+pit-artifact.workspace = true
 pit-runtime = { path = "../../crates/pit-runtime" }
 pit-scheduler = { path = "../../crates/pit-scheduler" }
 
