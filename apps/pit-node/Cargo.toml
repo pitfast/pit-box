@@ -14,3 +14,6 @@ pit-scheduler = { path = "../../crates/pit-scheduler" }
 [[bin]]
 name = "pit-node"
 path = "src/main.rs"
+
+[dev-dependencies]
+wat.workspace = true

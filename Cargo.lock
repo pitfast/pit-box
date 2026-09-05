@@ -1251,6 +1251,7 @@ dependencies = [
  "clap",
  "pit-runtime",
  "pit-scheduler",
+ "wat",
 ]
 
 [[package]]
@@ -1258,8 +1259,11 @@ name = "pit-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "sha2",
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
 ]
 
 [[package]]

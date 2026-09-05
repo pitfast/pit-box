@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use pit_node::PitNode;
+use pit_node::{ExecutionStatus, PitNode};
 
 #[derive(Debug, Parser)]
 #[command(name = "pit-node", about = "Run a local PitFast execution node")]
@@ -23,16 +23,17 @@ fn main() -> Result<()> {
         "pit-node completed {} of {} execution(s) on {} lane(s)",
         report.completed, report.requested, report.execution_lanes
     );
-    if report.failed > 0 {
+    if report.completed != report.requested {
         for execution in report
             .executions
             .iter()
-            .filter(|execution| !execution.success)
+            .filter(|execution| execution.status != ExecutionStatus::Completed)
         {
             eprintln!(
-                "execution {} failed on lane {}: {}",
+                "execution {} failed on lane {}: status={}, error={}",
                 execution.execution_id,
                 execution.lane_id,
+                execution.status,
                 execution.error.as_deref().unwrap_or("unknown error")
             );
         }

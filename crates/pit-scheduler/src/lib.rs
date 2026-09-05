@@ -234,6 +234,22 @@ impl PitScheduler {
         T: Send + 'static,
         F: Fn(ExecutionId, LaneId) -> Result<T> + Send + Sync + 'static,
     {
+        self.run_many_classified(count, task, |_| None)
+    }
+
+    /// Runs jobs while allowing a caller to classify a returned value as a
+    /// logical failure without losing that value from the result set.
+    pub fn run_many_classified<T, F, C>(
+        &self,
+        count: usize,
+        task: F,
+        classify: C,
+    ) -> Result<SchedulerRun<T>>
+    where
+        T: Send + 'static,
+        F: Fn(ExecutionId, LaneId) -> Result<T> + Send + Sync + 'static,
+        C: Fn(&T) -> Option<String> + Send + Sync + 'static,
+    {
         if count == 0 {
             bail!("execution count must be greater than zero");
         }
@@ -261,12 +277,14 @@ impl PitScheduler {
 
         let next_execution = Arc::new(AtomicUsize::new(0));
         let task = Arc::new(task);
+        let classify = Arc::new(classify);
         let results = Arc::new(Mutex::new(Vec::with_capacity(count)));
 
         thread::scope(|scope| {
             for lane in self.lanes.iter().copied() {
                 let next_execution = Arc::clone(&next_execution);
                 let task = Arc::clone(&task);
+                let classify = Arc::clone(&classify);
                 let results = Arc::clone(&results);
                 let run_state = Arc::clone(&run_state);
                 let execution_ids = Arc::clone(&execution_ids);
@@ -295,7 +313,10 @@ impl PitScheduler {
                         let outcome = task(execution_id, lane.id);
                         let duration = timer.elapsed();
                         let (success, error, value) = match outcome {
-                            Ok(value) => (true, None, Some(value)),
+                            Ok(value) => match classify(&value) {
+                                Some(error) => (false, Some(error), Some(value)),
+                                None => (true, None, Some(value)),
+                            },
                             Err(error) => (false, Some(error.to_string()), None),
                         };
 
