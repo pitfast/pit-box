@@ -130,7 +130,7 @@ impl PitHttpDispatcher {
     }
 
     pub fn register(&mut self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
-        let prepared = self.runtime.prepare(artifact)?;
+        let prepared = self.runtime.prepare_http(artifact)?;
         self.artifacts.insert(key.into(), Arc::new(prepared));
         Ok(())
     }

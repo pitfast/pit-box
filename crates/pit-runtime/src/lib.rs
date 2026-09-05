@@ -310,6 +310,18 @@ impl PitRuntime {
     }
 
     pub fn prepare(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
+        self.prepare_with_world(artifact, None)
+    }
+
+    pub fn prepare_http(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
+        self.prepare_with_world(artifact, Some("wasi:http/proxy"))
+    }
+
+    fn prepare_with_world(
+        &self,
+        artifact: WasmArtifact,
+        requested_world: Option<&str>,
+    ) -> Result<PreparedArtifact> {
         let bytes = match artifact.source() {
             ArtifactSource::Path(path) => {
                 if !path.exists() {
@@ -324,7 +336,7 @@ impl PitRuntime {
             ArtifactSource::Bytes(bytes) => bytes.to_vec(),
         };
         let format = detect_format(&bytes)?;
-        let (module, p1_linker, component, p2_linker, http_linker) = match format {
+        let (module, p1_linker, component, p2_linker, http_pre) = match format {
             ArtifactFormat::CoreModule => (
                 Some(
                     Module::from_binary(&self.engine, &bytes)
@@ -345,7 +357,15 @@ impl PitRuntime {
                     .context("failed to link WASI Preview 2 HTTP base")?;
                 wasmtime_wasi_http::add_only_http_to_linker_sync(&mut http_linker)
                     .context("failed to link WASI HTTP")?;
-                (None, None, Some(component), Some(linker), Some(http_linker))
+                let http_pre = requested_world
+                    .filter(|world| *world == "wasi:http/proxy")
+                    .map(|_| {
+                        wasmtime_wasi_http::bindings::sync::ProxyPre::new(
+                            http_linker.instantiate_pre(&component)?,
+                        )
+                    })
+                    .transpose()?;
+                (None, None, Some(component), Some(linker), http_pre)
             }
         };
         Ok(PreparedArtifact {
@@ -354,7 +374,7 @@ impl PitRuntime {
             p1_linker,
             component,
             p2_linker,
-            http_linker,
+            http_pre,
             artifact,
             ticker: Arc::clone(&self.ticker),
         })
@@ -373,7 +393,7 @@ pub struct PreparedArtifact {
     p1_linker: Option<CoreLinker<HostState>>,
     component: Option<Component>,
     p2_linker: Option<ComponentLinker<P2HostState>>,
-    http_linker: Option<ComponentLinker<HttpHostState>>,
+    http_pre: Option<wasmtime_wasi_http::bindings::sync::ProxyPre<HttpHostState>>,
     artifact: WasmArtifact,
     ticker: Arc<EpochTicker>,
 }
@@ -662,15 +682,11 @@ impl PreparedArtifact {
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let output = store.data_mut().new_response_outparam(sender)?;
-        let proxy = wasmtime_wasi_http::bindings::sync::Proxy::instantiate(
-            &mut store,
-            self.component
-                .as_ref()
-                .ok_or_else(|| anyhow!("HTTP execution requires a component"))?,
-            self.http_linker
-                .as_ref()
-                .ok_or_else(|| anyhow!("HTTP linker was not prepared"))?,
-        )?;
+        let proxy = self
+            .http_pre
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP proxy was not prepared"))?
+            .instantiate(&mut store)?;
         let call_result = proxy
             .wasi_http_incoming_handler()
             .call_handle(&mut store, req, output);
