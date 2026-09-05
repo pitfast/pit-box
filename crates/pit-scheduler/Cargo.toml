@@ -1,0 +1,10 @@
+[package]
+name = "pit-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local CPU-lane scheduler for PitFast WASM executions"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
