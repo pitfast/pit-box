@@ -1,0 +1,16 @@
+[package]
+name = "pit-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local PitFast execution node"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pit-runtime = { path = "../../crates/pit-runtime" }
+pit-scheduler = { path = "../../crates/pit-scheduler" }
+
+[[bin]]
+name = "pit-node"
+path = "src/main.rs"
