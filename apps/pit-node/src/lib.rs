@@ -130,6 +130,13 @@ impl PitHttpDispatcher {
         self.scheduler.shared_peak_active()
     }
 
+    pub fn has_prepared(&self, key: &str) -> bool {
+        self.artifacts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(key)
+    }
+
     pub fn register(&self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
         let prepared = self.runtime.prepare_http(artifact)?;
         self.artifacts
