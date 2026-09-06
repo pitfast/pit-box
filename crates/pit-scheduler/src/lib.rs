@@ -179,6 +179,7 @@ pub struct PitScheduler {
     run_lock: Arc<Mutex<()>>,
     shared_lanes: Arc<(Mutex<Vec<bool>>, std::sync::Condvar)>,
     shared_active: Arc<AtomicUsize>,
+    shared_waiting: Arc<AtomicUsize>,
     shared_peak: Arc<AtomicUsize>,
 }
 
@@ -202,6 +203,7 @@ impl PitScheduler {
                 std::sync::Condvar::new(),
             )),
             shared_active: Arc::new(AtomicUsize::new(0)),
+            shared_waiting: Arc::new(AtomicUsize::new(0)),
             shared_peak: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -224,6 +226,7 @@ impl PitScheduler {
                 std::sync::Condvar::new(),
             )),
             shared_active: Arc::new(AtomicUsize::new(0)),
+            shared_waiting: Arc::new(AtomicUsize::new(0)),
             shared_peak: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -243,6 +246,44 @@ impl PitScheduler {
         self.shared_peak.load(Ordering::Acquire)
     }
 
+    /// Current number of executions occupying shared lanes.
+    pub fn shared_active(&self) -> usize {
+        self.shared_active.load(Ordering::Acquire)
+    }
+
+    /// Current number of callers waiting for a shared lane.
+    pub fn shared_waiting(&self) -> usize {
+        self.shared_waiting.load(Ordering::Acquire)
+    }
+
+    /// A lightweight live view used by Garage heartbeats. It intentionally
+    /// does not pretend that a `run_one` caller has an execution id before the
+    /// caller enters the lane.
+    pub fn shared_snapshot(&self) -> SchedulerSnapshot {
+        let (lock, _) = &*self.shared_lanes;
+        let occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        SchedulerSnapshot {
+            lane_count: self.lane_count(),
+            running: self.shared_active(),
+            queued: self.shared_waiting(),
+            completed: 0,
+            failed: 0,
+            peak_active: self.shared_peak_active(),
+            lanes: occupied
+                .iter()
+                .map(|used| {
+                    if *used {
+                        LaneState::Running {
+                            execution_id: ExecutionId(0),
+                        }
+                    } else {
+                        LaneState::Free
+                    }
+                })
+                .collect(),
+        }
+    }
+
     /// Runs one task using the scheduler's shared lane pool. Unlike a batch,
     /// concurrent callers can occupy different lanes; this is the ingress API
     /// used by PitLane.
@@ -253,6 +294,7 @@ impl PitScheduler {
     {
         let execution_id = ExecutionId(self.next_execution_id.fetch_add(1, Ordering::Relaxed));
         let queued_at = Instant::now();
+        self.shared_waiting.fetch_add(1, Ordering::AcqRel);
         let (lock, wake) = &*self.shared_lanes;
         let mut occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let lane = loop {
@@ -264,6 +306,7 @@ impl PitScheduler {
                 .wait(occupied)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         };
+        self.shared_waiting.fetch_sub(1, Ordering::AcqRel);
         drop(occupied);
         let active = self.shared_active.fetch_add(1, Ordering::AcqRel) + 1;
         self.shared_peak.fetch_max(active, Ordering::AcqRel);

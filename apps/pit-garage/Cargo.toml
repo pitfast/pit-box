@@ -1,0 +1,32 @@
+[package]
+name = "pit-garage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PitFast Garage execution agent around PitBox"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+pit-artifact.workspace = true
+pit-circuit-core.workspace = true
+pit-deployment.workspace = true
+pit-lane-core.workspace = true
+pit-node = { path = "../pit-node" }
+pit-paddock-core.workspace = true
+pit-paddock-factory.workspace = true
+pit-paddock-fs.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "pit-garage"
+path = "src/main.rs"

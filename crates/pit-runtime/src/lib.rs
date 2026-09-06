@@ -262,6 +262,10 @@ pub struct HttpRequest {
     /// Exact host-owned TCP endpoints the guest may connect to. Empty means
     /// that TCP, UDP, and name lookup remain unavailable.
     pub allowed_tcp: Vec<std::net::SocketAddr>,
+    /// Garage identity for distributed nested-invocation correlation.
+    pub source_garage_id: Option<String>,
+    /// Garages already traversed by this logical invocation path.
+    pub visited_garages: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +765,8 @@ impl PreparedArtifact {
                     service_invoker,
                     parent_execution_id,
                     invocation_depth,
+                    source_garage_id: request.source_garage_id.clone(),
+                    visited_garages: request.visited_garages.clone(),
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1035,6 +1041,8 @@ struct HttpHostState {
     service_invoker: Option<Arc<dyn ServiceInvoker>>,
     parent_execution_id: Option<String>,
     invocation_depth: u16,
+    source_garage_id: Option<String>,
+    visited_garages: Vec<String>,
 }
 
 impl WasiView for P2HostState {
@@ -1111,6 +1119,8 @@ impl WasiHttpView for HttpHostState {
             body,
             parent_execution_id: self.parent_execution_id.clone(),
             depth: self.invocation_depth.saturating_add(1),
+            source_garage_id: self.source_garage_id.clone(),
+            visited_garages: self.visited_garages.clone(),
         };
         // The synchronous v39 binding can call this hook while a Tokio bridge
         // is active. Move the direct child execution off that bridge so the
@@ -1186,6 +1196,8 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
         }
         let parent_execution_id = self.parent_execution_id.clone();
         let depth = self.invocation_depth.saturating_add(1);
+        let source_garage_id = self.source_garage_id.clone();
+        let visited_garages = self.visited_garages.clone();
         let invoker = Arc::clone(invoker);
         let response = std::thread::spawn(move || {
             invoker.invoke(ServiceInvocationRequest {
@@ -1195,6 +1207,8 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
                 body: Bytes::from(request.body),
                 parent_execution_id,
                 depth,
+                source_garage_id,
+                visited_garages,
             })
         })
         .join()

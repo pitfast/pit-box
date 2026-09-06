@@ -115,9 +115,17 @@ pub struct HttpDispatchResult {
 
 impl PitHttpDispatcher {
     pub fn new() -> Result<Self> {
+        Self::with_scheduler(PitScheduler::local())
+    }
+
+    pub fn with_lanes(lanes: usize) -> Result<Self> {
+        Self::with_scheduler(PitScheduler::new(lanes)?)
+    }
+
+    fn with_scheduler(scheduler: PitScheduler) -> Result<Self> {
         Ok(Self {
             runtime: PitRuntime::new()?,
-            scheduler: PitScheduler::local(),
+            scheduler,
             artifacts: RwLock::new(std::collections::HashMap::new()),
         })
     }
@@ -128,6 +136,22 @@ impl PitHttpDispatcher {
 
     pub fn shared_peak_active(&self) -> usize {
         self.scheduler.shared_peak_active()
+    }
+
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        self.scheduler.shared_snapshot()
+    }
+
+    pub fn prepared_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .artifacts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     pub fn has_prepared(&self, key: &str) -> bool {
