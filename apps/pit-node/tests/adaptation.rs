@@ -41,7 +41,7 @@ fn adapted_http_component_executes_through_generic_pitbox() {
         std::env::var("PITFAST_ADAPTER_EXPECTED").unwrap_or_else(|_| "mystery-asgi".into());
     assert_eq!(response.body, expected.as_bytes());
     if std::env::var_os("PITFAST_ADAPTER_TEST_ECHO").is_some() {
-        let echo = dispatcher
+        let echo_result = dispatcher
             .execute_http(
                 "adapted",
                 HttpRequest {
@@ -57,10 +57,18 @@ fn adapted_http_component_executes_through_generic_pitbox() {
                 ExecutionLimits::default(),
                 CancellationToken::new(),
             )
-            .expect("adapted POST should execute")
-            .response
-            .expect("adapted POST should return a response");
-        assert_eq!(echo.status, 200);
+            .expect("adapted POST should execute");
+        let echo = echo_result.response.unwrap_or_else(|| {
+            panic!(
+                "adapted POST should return a response: {:?}",
+                echo_result.error
+            )
+        });
+        let expected_status = std::env::var("PITFAST_ADAPTER_ECHO_STATUS")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(200);
+        assert_eq!(echo.status, expected_status);
         assert_eq!(echo.body, b"adapter-body");
     }
 }
