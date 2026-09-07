@@ -460,6 +460,8 @@ impl GarageAgent {
             allowed_tcp: Vec::new(),
             source_garage_id: Some(self.id.to_string()),
             visited_garages: visited.into_iter().map(|id| id.to_string()).collect(),
+            application_id: request.application_id.clone(),
+            release_id: request.release_id.clone(),
         };
         self.executions.fetch_add(1, Ordering::Relaxed);
         let dispatcher = Arc::clone(&self.dispatcher);
@@ -628,6 +630,8 @@ impl ServiceInvoker for GarageServiceInvoker {
                     .into_iter()
                     .filter_map(|value| value.parse().ok())
                     .collect(),
+                application_id: request.application_id,
+                release_id: request.release_id,
             })
             .send()
             .context("PitLane internal invocation request failed")?;

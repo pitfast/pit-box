@@ -334,6 +334,9 @@ pub struct HttpRequest {
     pub source_garage_id: Option<String>,
     /// Garages already traversed by this logical invocation path.
     pub visited_garages: Vec<String>,
+    /// Immutable application release context captured at ingress.
+    pub application_id: Option<String>,
+    pub release_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1512,8 @@ impl PreparedArtifact {
                     invocation_depth,
                     source_garage_id: request.source_garage_id.clone(),
                     visited_garages: request.visited_garages.clone(),
+                    application_id: request.application_id.clone(),
+                    release_id: request.release_id.clone(),
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1808,6 +1813,8 @@ struct HttpHostState {
     invocation_depth: u16,
     source_garage_id: Option<String>,
     visited_garages: Vec<String>,
+    application_id: Option<String>,
+    release_id: Option<String>,
 }
 
 impl WasiView for P2HostState {
@@ -1886,6 +1893,8 @@ impl WasiHttpView for HttpHostState {
             depth: self.invocation_depth.saturating_add(1),
             source_garage_id: self.source_garage_id.clone(),
             visited_garages: self.visited_garages.clone(),
+            application_id: self.application_id.clone(),
+            release_id: self.release_id.clone(),
         };
         // The synchronous v39 binding can call this hook while a Tokio bridge
         // is active. Move the direct child execution off that bridge so the
@@ -1963,6 +1972,8 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
         let depth = self.invocation_depth.saturating_add(1);
         let source_garage_id = self.source_garage_id.clone();
         let visited_garages = self.visited_garages.clone();
+        let application_id = self.application_id.clone();
+        let release_id = self.release_id.clone();
         let invoker = Arc::clone(invoker);
         let response = std::thread::spawn(move || {
             invoker.invoke(ServiceInvocationRequest {
@@ -1974,6 +1985,8 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
                 depth,
                 source_garage_id,
                 visited_garages,
+                application_id,
+                release_id,
             })
         })
         .join()

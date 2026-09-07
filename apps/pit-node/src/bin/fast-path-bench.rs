@@ -194,6 +194,8 @@ fn main() -> Result<()> {
         allowed_tcp: Vec::new(),
         source_garage_id: None,
         visited_garages: Vec::new(),
+        application_id: None,
+        release_id: None,
     };
     let runtime_config = PitRuntimeConfig {
         compiled_cache_restore: restore_mode,
