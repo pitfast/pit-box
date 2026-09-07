@@ -328,9 +328,7 @@ impl GarageAgent {
                 preparation: pit_node::PreparationReport {
                     readiness: pit_node::ReadinessState::Hot,
                     source: CompiledCacheSource::WarmRestored,
-                    compile_duration: Duration::ZERO,
-                    restore_duration: Duration::ZERO,
-                    cache_publication_duration: Duration::ZERO,
+                    ..pit_node::PreparationReport::default()
                 },
                 duration: started.elapsed(),
             });
@@ -364,7 +362,10 @@ impl GarageAgent {
         let path = artifact_path.clone();
         let key = digest.to_string();
         let report = tokio::task::spawn_blocking(move || {
-            dispatcher.register_with_report(key, pit_node::WasmArtifact::from_path(&path))
+            dispatcher.register_with_report(
+                key.clone(),
+                pit_node::WasmArtifact::from_path_with_digest(&path, key),
+            )
         })
         .await??;
         match report.source {

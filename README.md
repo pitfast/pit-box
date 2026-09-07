@@ -101,10 +101,18 @@ active lane       →  RUN
 
 The compiled cache is keyed by the artifact digest and a Wasmtime 39 engine
 compatibility fingerprint (host architecture, format/world, compiler
-configuration hash, and cache schema). Cache metadata is checked before
-deserialization; missing, corrupt, or incompatible entries fall back to the
-canonical `.wasm`. Cache publication is temporary-file plus fsync plus atomic
-rename, so it cannot become deployment authority or expose a partial entry.
+configuration hash, and cache schema). The normal Garage path uses Wasmtime's
+file-backed component deserializer; the byte-buffer path remains an explicit
+compatibility/A-B option. Cache metadata is checked before deserialization;
+missing, corrupt, or incompatible entries fall back to the canonical `.wasm`.
+Cache publication is temporary-file plus fsync plus atomic rename, so it
+cannot become deployment authority or expose a partial entry.
+
+The deployment plane passes its already-verified immutable digest to
+`WasmArtifact::from_path_with_digest`. This avoids re-hashing large canonical
+artifacts during warm cache lookup without changing the canonical-artifact
+trust boundary. Callers that only have a path still get memoized digest
+calculation.
 
 Garage artifact acquisition, verification, compilation, compiled-cache restore,
 and PreparedArtifact construction run under a bounded preparation budget before
@@ -113,6 +121,13 @@ artifact is execution-ready. A per-digest singleflight prevents concurrent
 requests from repeating the same warmup. The scheduler reports queue wait as
 Scheduling Gap and exposes logical Grid Utilization; neither metric represents
 physical CPU utilization.
+
+PitFast does not expose a separate `PRIMED` readiness state in this runtime:
+the safe reusable HTTP representation is already the HOT `ProxyPre` plus
+immutable compiled component. Pre-instantiating guest Stores would create
+replica-like state and threaten per-invocation isolation, while the shared
+Wasmtime allocator is infrastructure rather than service readiness. Pooling
+allocator configurations were evaluated experimentally and remain opt-in.
 
 ## Quick start
 

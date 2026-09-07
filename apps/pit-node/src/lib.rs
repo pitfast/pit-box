@@ -14,9 +14,10 @@ use pit_scheduler::{
 };
 
 pub use pit_runtime::{
-    ArtifactId, ArtifactSource, CancellationToken, CompiledCacheConfig, CompiledCacheSource,
-    ExecutionLimits, ExecutionRequest, ExecutionStatus, HttpRequest, HttpResponse,
-    PreparationReport, ReadinessState, WasmArtifact, validate_env_entry,
+    ArtifactId, ArtifactSource, CancellationToken, CompiledCacheConfig, CompiledCacheRestoreMode,
+    CompiledCacheSource, ExecutionLimits, ExecutionRequest, ExecutionStatus, HttpExecutionTimings,
+    HttpRequest, HttpResponse, PitRuntimeConfig, PreparationReport, ReadinessState,
+    RuntimeAllocationMode, WasmArtifact, validate_env_entry,
 };
 
 /// Validate a project artifact's runtime contract against this local PitBox.
@@ -116,6 +117,7 @@ pub struct HttpDispatchResult {
     pub duration: Duration,
     pub guest_started_after_request: Duration,
     pub prepared_lookup: Duration,
+    pub runtime_timings: HttpExecutionTimings,
 }
 
 impl PitHttpDispatcher {
@@ -127,9 +129,20 @@ impl PitHttpDispatcher {
         Self::with_scheduler(PitScheduler::new(lanes)?)
     }
 
+    pub fn with_options(lanes: usize, runtime_config: PitRuntimeConfig) -> Result<Self> {
+        Self::with_scheduler_and_runtime(PitScheduler::new(lanes)?, runtime_config)
+    }
+
     fn with_scheduler(scheduler: PitScheduler) -> Result<Self> {
+        Self::with_scheduler_and_runtime(scheduler, PitRuntimeConfig::default())
+    }
+
+    fn with_scheduler_and_runtime(
+        scheduler: PitScheduler,
+        runtime_config: PitRuntimeConfig,
+    ) -> Result<Self> {
         Ok(Self {
-            runtime: PitRuntime::new()?,
+            runtime: PitRuntime::with_config(runtime_config)?,
             scheduler,
             artifacts: RwLock::new(std::collections::HashMap::new()),
             compiled_cache: None,
@@ -138,6 +151,17 @@ impl PitHttpDispatcher {
 
     pub fn with_compiled_cache(lanes: usize, root: impl AsRef<Path>) -> Result<Self> {
         let mut dispatcher = Self::with_scheduler(PitScheduler::new(lanes)?)?;
+        dispatcher.compiled_cache = Some(CompiledCacheConfig::new(root.as_ref()));
+        Ok(dispatcher)
+    }
+
+    pub fn with_compiled_cache_options(
+        lanes: usize,
+        root: impl AsRef<Path>,
+        runtime_config: PitRuntimeConfig,
+    ) -> Result<Self> {
+        let mut dispatcher =
+            Self::with_scheduler_and_runtime(PitScheduler::new(lanes)?, runtime_config)?;
         dispatcher.compiled_cache = Some(CompiledCacheConfig::new(root.as_ref()));
         Ok(dispatcher)
     }
@@ -198,13 +222,7 @@ impl PitHttpDispatcher {
         } else {
             (
                 self.runtime.prepare_http(artifact)?,
-                PreparationReport {
-                    readiness: ReadinessState::Cold,
-                    source: CompiledCacheSource::ColdCompiled,
-                    compile_duration: Duration::ZERO,
-                    restore_duration: Duration::ZERO,
-                    cache_publication_duration: Duration::ZERO,
-                },
+                PreparationReport::default(),
             )
         };
         self.artifacts
@@ -248,7 +266,7 @@ impl PitHttpDispatcher {
         let guest_started_for_task = Arc::clone(&guest_started);
         let scheduled = self.scheduler.run_one(move |execution_id, _| {
             *guest_started_for_task.lock().unwrap() = Some(request_received.elapsed());
-            prepared.execute_http_with_invoker(
+            prepared.execute_http_with_invoker_timed(
                 &request,
                 cancellation.clone(),
                 limits.clone(),
@@ -258,10 +276,14 @@ impl PitHttpDispatcher {
             )
         })?;
         let report = scheduled.report;
+        let (response, runtime_timings) = scheduled.value.map_or_else(
+            || (None, HttpExecutionTimings::default()),
+            |(value, timings)| (Some(value), timings),
+        );
         Ok(HttpDispatchResult {
             execution_id: report.execution_id,
             lane_id: report.lane_id,
-            response: scheduled.value,
+            response,
             error: report.error,
             queued_for: report.queued_for,
             scheduling_gap: report.scheduling_gap,
@@ -271,6 +293,7 @@ impl PitHttpDispatcher {
                 .unwrap()
                 .unwrap_or_else(|| request_received.elapsed()),
             prepared_lookup,
+            runtime_timings,
         })
     }
 
