@@ -81,6 +81,10 @@ pub struct ExecutionReport {
     pub started: SystemTime,
     /// Time spent waiting in the scheduler queue before starting.
     pub queued_for: Duration,
+    /// Time between work becoming schedulable and a lane assignment. This is
+    /// the scheduler's measured Scheduling Gap; with an immediately free lane
+    /// it is zero.
+    pub scheduling_gap: Duration,
     /// Wall-clock time spent in the invocation.
     pub duration: Duration,
     /// Whether the invocation returned successfully.
@@ -181,6 +185,8 @@ pub struct PitScheduler {
     shared_active: Arc<AtomicUsize>,
     shared_waiting: Arc<AtomicUsize>,
     shared_peak: Arc<AtomicUsize>,
+    created_at: Arc<Instant>,
+    busy_nanos: Arc<AtomicU64>,
 }
 
 impl PitScheduler {
@@ -205,6 +211,8 @@ impl PitScheduler {
             shared_active: Arc::new(AtomicUsize::new(0)),
             shared_waiting: Arc::new(AtomicUsize::new(0)),
             shared_peak: Arc::new(AtomicUsize::new(0)),
+            created_at: Arc::new(Instant::now()),
+            busy_nanos: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -228,6 +236,8 @@ impl PitScheduler {
             shared_active: Arc::new(AtomicUsize::new(0)),
             shared_waiting: Arc::new(AtomicUsize::new(0)),
             shared_peak: Arc::new(AtomicUsize::new(0)),
+            created_at: Arc::new(Instant::now()),
+            busy_nanos: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -254,6 +264,22 @@ impl PitScheduler {
     /// Current number of callers waiting for a shared lane.
     pub fn shared_waiting(&self) -> usize {
         self.shared_waiting.load(Ordering::Acquire)
+    }
+
+    /// Logical execution-grid utilization since this scheduler was created.
+    /// This is lane busy time divided by available lane time; it is not a
+    /// physical CPU utilization measurement.
+    pub fn grid_utilization(&self) -> f64 {
+        let elapsed_nanos = self.created_at.elapsed().as_nanos();
+        if elapsed_nanos == 0 || self.lane_count() == 0 {
+            return 0.0;
+        }
+        let capacity = elapsed_nanos.saturating_mul(self.lane_count() as u128);
+        (self.busy_nanos.load(Ordering::Acquire) as f64 / capacity as f64).min(1.0)
+    }
+
+    pub fn busy_time(&self) -> Duration {
+        Duration::from_nanos(self.busy_nanos.load(Ordering::Acquire))
     }
 
     /// A lightweight live view used by Garage heartbeats. It intentionally
@@ -315,6 +341,10 @@ impl PitScheduler {
         let timer = Instant::now();
         let outcome = task(execution_id, lane);
         let duration = timer.elapsed();
+        self.busy_nanos.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::AcqRel,
+        );
         let (success, error, value) = match outcome {
             Ok(value) => (true, None, Some(value)),
             Err(error) => (false, Some(error.to_string()), None),
@@ -324,6 +354,7 @@ impl PitScheduler {
             lane_id: lane,
             started,
             queued_for,
+            scheduling_gap: queued_for,
             duration,
             success,
             error,
@@ -424,6 +455,9 @@ impl PitScheduler {
                         let timer = Instant::now();
                         let outcome = task(execution_id, lane.id);
                         let duration = timer.elapsed();
+                        // The batch scheduler assigns the next queued item
+                        // directly to the lane that just became free, so its
+                        // scheduling gap is the measured queue wait.
                         let (success, error, value) = match outcome {
                             Ok(value) => match classify(&value) {
                                 Some(error) => (false, Some(error), Some(value)),
@@ -437,10 +471,15 @@ impl PitScheduler {
                             lane_id: lane.id,
                             started,
                             queued_for,
+                            scheduling_gap: queued_for,
                             duration,
                             success,
                             error: error.clone(),
                         };
+                        self.busy_nanos.fetch_add(
+                            duration.as_nanos().min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
+                        );
                         if success {
                             run_state.completed.fetch_add(1, Ordering::AcqRel);
                             run_state.push_event(ExecutionEvent::Completed {

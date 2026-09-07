@@ -87,6 +87,33 @@ Nested logical service calls are handled inline by the PitLane-backed host
 invoker rather than recursively submitted to the scheduler. This prevents all
 execution lanes from waiting on child calls.
 
+## Execution readiness and the PitStop fast path
+
+For HTTP components, PitBox keeps the portable artifact authoritative and
+treats machine-ready compilation as a disposable Garage-local cache:
+
+~~~text
+canonical .wasm  →  COLD
+compiled .cwasm  →  WARM
+PreparedArtifact  →  HOT
+active lane       →  RUN
+~~~
+
+The compiled cache is keyed by the artifact digest and a Wasmtime 39 engine
+compatibility fingerprint (host architecture, format/world, compiler
+configuration hash, and cache schema). Cache metadata is checked before
+deserialization; missing, corrupt, or incompatible entries fall back to the
+canonical `.wasm`. Cache publication is temporary-file plus fsync plus atomic
+rename, so it cannot become deployment authority or expose a partial entry.
+
+Garage artifact acquisition, verification, compilation, compiled-cache restore,
+and PreparedArtifact construction run under a bounded preparation budget before
+PitBox scheduler admission. Execution Lanes are reserved only after the
+artifact is execution-ready. A per-digest singleflight prevents concurrent
+requests from repeating the same warmup. The scheduler reports queue wait as
+Scheduling Gap and exposes logical Grid Utilization; neither metric represents
+physical CPU utilization.
+
 ## Quick start
 
 Build the workspace:
@@ -137,8 +164,10 @@ execution events.
 
 ## Current scope
 
-The current milestone is single-node local execution with scheduler telemetry,
-queue/backpressure visibility, and a CPU-bound concurrency benchmark.
+The current milestone includes local execution plus the v0.9 Circuit/Garage
+placement path, with scheduler telemetry, queue/backpressure visibility, and
+the v0.10 PitStop readiness path. Garage startup restores WARM compiled entries
+lazily; it does not load every cache entry into memory.
 
 Future work includes multinode routing, adaptive execution, PitCrew warm
 capabilities, and a telemetry cockpit. Networking, containers, Kubernetes,

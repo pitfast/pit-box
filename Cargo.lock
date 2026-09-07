@@ -1706,6 +1706,9 @@ dependencies = [
  "pit-lane-core",
  "pit-runtime",
  "pit-scheduler",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "wat",
 ]
 
@@ -1769,6 +1772,8 @@ dependencies = [
  "hyper",
  "pit-artifact",
  "pit-lane-core",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",

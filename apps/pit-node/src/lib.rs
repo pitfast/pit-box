@@ -14,8 +14,9 @@ use pit_scheduler::{
 };
 
 pub use pit_runtime::{
-    ArtifactId, ArtifactSource, CancellationToken, ExecutionLimits, ExecutionRequest,
-    ExecutionStatus, HttpRequest, HttpResponse, WasmArtifact, validate_env_entry,
+    ArtifactId, ArtifactSource, CancellationToken, CompiledCacheConfig, CompiledCacheSource,
+    ExecutionLimits, ExecutionRequest, ExecutionStatus, HttpRequest, HttpResponse,
+    PreparationReport, ReadinessState, WasmArtifact, validate_env_entry,
 };
 
 /// Validate a project artifact's runtime contract against this local PitBox.
@@ -101,6 +102,7 @@ pub struct PitHttpDispatcher {
     runtime: PitRuntime,
     scheduler: PitScheduler,
     artifacts: RwLock<std::collections::HashMap<String, Arc<PreparedArtifact>>>,
+    compiled_cache: Option<CompiledCacheConfig>,
 }
 
 #[derive(Debug)]
@@ -110,7 +112,10 @@ pub struct HttpDispatchResult {
     pub response: Option<HttpResponse>,
     pub error: Option<String>,
     pub queued_for: Duration,
+    pub scheduling_gap: Duration,
     pub duration: Duration,
+    pub guest_started_after_request: Duration,
+    pub prepared_lookup: Duration,
 }
 
 impl PitHttpDispatcher {
@@ -127,7 +132,14 @@ impl PitHttpDispatcher {
             runtime: PitRuntime::new()?,
             scheduler,
             artifacts: RwLock::new(std::collections::HashMap::new()),
+            compiled_cache: None,
         })
+    }
+
+    pub fn with_compiled_cache(lanes: usize, root: impl AsRef<Path>) -> Result<Self> {
+        let mut dispatcher = Self::with_scheduler(PitScheduler::new(lanes)?)?;
+        dispatcher.compiled_cache = Some(CompiledCacheConfig::new(root.as_ref()));
+        Ok(dispatcher)
     }
 
     pub fn execution_lanes(&self) -> usize {
@@ -142,6 +154,10 @@ impl PitHttpDispatcher {
         self.scheduler.shared_snapshot()
     }
 
+    pub fn grid_utilization(&self) -> f64 {
+        self.scheduler.grid_utilization()
+    }
+
     pub fn prepared_keys(&self) -> Vec<String> {
         let mut keys = self
             .artifacts
@@ -154,6 +170,13 @@ impl PitHttpDispatcher {
         keys
     }
 
+    pub fn warm_keys(&self) -> Vec<String> {
+        self.compiled_cache
+            .as_ref()
+            .map(pit_runtime::PitRuntime::warm_digests)
+            .unwrap_or_default()
+    }
+
     pub fn has_prepared(&self, key: &str) -> bool {
         self.artifacts
             .read()
@@ -162,12 +185,33 @@ impl PitHttpDispatcher {
     }
 
     pub fn register(&self, key: impl Into<String>, artifact: WasmArtifact) -> Result<()> {
-        let prepared = self.runtime.prepare_http(artifact)?;
+        self.register_with_report(key, artifact).map(|_| ())
+    }
+
+    pub fn register_with_report(
+        &self,
+        key: impl Into<String>,
+        artifact: WasmArtifact,
+    ) -> Result<PreparationReport> {
+        let (prepared, report) = if let Some(cache) = &self.compiled_cache {
+            self.runtime.prepare_http_cached(artifact, cache)?
+        } else {
+            (
+                self.runtime.prepare_http(artifact)?,
+                PreparationReport {
+                    readiness: ReadinessState::Cold,
+                    source: CompiledCacheSource::ColdCompiled,
+                    compile_duration: Duration::ZERO,
+                    restore_duration: Duration::ZERO,
+                    cache_publication_duration: Duration::ZERO,
+                },
+            )
+        };
         self.artifacts
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key.into(), Arc::new(prepared));
-        Ok(())
+        Ok(report)
     }
 
     pub fn execute_http(
@@ -189,6 +233,8 @@ impl PitHttpDispatcher {
         service_invoker: Option<Arc<dyn ServiceInvoker>>,
         invocation_depth: u16,
     ) -> Result<HttpDispatchResult> {
+        let request_received = Instant::now();
+        let lookup_started = Instant::now();
         let prepared = self
             .artifacts
             .read()
@@ -196,8 +242,12 @@ impl PitHttpDispatcher {
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("unknown prepared HTTP artifact '{key}'"))?;
+        let prepared_lookup = lookup_started.elapsed();
         let request = Arc::new(request);
+        let guest_started = Arc::new(std::sync::Mutex::new(None));
+        let guest_started_for_task = Arc::clone(&guest_started);
         let scheduled = self.scheduler.run_one(move |execution_id, _| {
+            *guest_started_for_task.lock().unwrap() = Some(request_received.elapsed());
             prepared.execute_http_with_invoker(
                 &request,
                 cancellation.clone(),
@@ -214,7 +264,13 @@ impl PitHttpDispatcher {
             response: scheduled.value,
             error: report.error,
             queued_for: report.queued_for,
+            scheduling_gap: report.scheduling_gap,
             duration: report.duration,
+            guest_started_after_request: guest_started
+                .lock()
+                .unwrap()
+                .unwrap_or_else(|| request_received.elapsed()),
+            prepared_lookup,
         })
     }
 

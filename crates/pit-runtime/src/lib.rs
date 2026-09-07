@@ -7,7 +7,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
@@ -18,6 +18,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use pit_artifact::ArtifactFormat;
 use pit_lane_core::{PitUri, ServiceInvocationRequest, ServiceInvoker};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
 use wasmparser::{Encoding, Parser, Payload};
@@ -322,6 +323,298 @@ pub struct PitRuntime {
     http_ticker: Arc<EpochTicker>,
 }
 
+/// Persistent, machine-specific acceleration cache for compiled Wasm.
+///
+/// The cache is never authoritative: the portable artifact remains the source
+/// of truth and every cache entry is disposable.
+#[derive(Debug, Clone)]
+pub struct CompiledCacheConfig {
+    pub root: PathBuf,
+    pub max_bytes: u64,
+}
+
+impl CompiledCacheConfig {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            max_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn default_root() -> Result<PathBuf> {
+        if let Some(value) = std::env::var_os("XDG_CACHE_HOME") {
+            return Ok(PathBuf::from(value).join("pit/compiled"));
+        }
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow!("HOME is unavailable; set XDG_CACHE_HOME"))?;
+        Ok(PathBuf::from(home).join(".cache/pit/compiled"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessState {
+    Cold,
+    Warm,
+    Hot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledCacheSource {
+    ColdCompiled,
+    WarmRestored,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparationReport {
+    pub readiness: ReadinessState,
+    pub source: CompiledCacheSource,
+    pub compile_duration: Duration,
+    pub restore_duration: Duration,
+    pub cache_publication_duration: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompiledCacheMetadata {
+    schema_version: u32,
+    artifact_digest: String,
+    fingerprint: String,
+    wasmtime: String,
+    target: String,
+    architecture: String,
+    format: String,
+    world: String,
+    wasm_size_bytes: u64,
+    compiled_size_bytes: u64,
+}
+
+const COMPILED_CACHE_SCHEMA: u32 = 2;
+const WASMTIME_VERSION: &str = "39.0.2";
+static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Exact compatibility inputs used to distinguish machine-ready cache entries.
+/// The canonical portable `.wasm` digest remains deployment authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompileFingerprint {
+    pub schema_version: u32,
+    pub wasmtime: String,
+    pub target: String,
+    pub architecture: String,
+    pub format: String,
+    pub world: String,
+    pub engine_compatibility_hash: String,
+}
+
+impl CompileFingerprint {
+    fn for_engine(engine: &Engine, format: ArtifactFormat, world: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        engine.precompile_compatibility_hash().hash(&mut hasher);
+        Self {
+            schema_version: COMPILED_CACHE_SCHEMA,
+            wasmtime: WASMTIME_VERSION.to_owned(),
+            target: format!(
+                "{}-{}-{}",
+                std::env::consts::ARCH,
+                std::env::consts::OS,
+                std::env::consts::FAMILY
+            ),
+            architecture: std::env::consts::ARCH.to_owned(),
+            format: format.to_string(),
+            world: world.to_owned(),
+            engine_compatibility_hash: format!("{:016x}", hasher.finish()),
+        }
+    }
+
+    pub fn value(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("CompileFingerprint is serializable");
+        format!("v{}-{:x}", self.schema_version, Sha256::digest(encoded))
+    }
+}
+
+struct CompiledCacheEntry {
+    bytes: Vec<u8>,
+    source: CompiledCacheSource,
+    compile_duration: Duration,
+    restore_duration: Duration,
+    publication_duration: Duration,
+}
+
+fn artifact_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn engine_fingerprint(engine: &Engine, format: ArtifactFormat, world: &str) -> String {
+    CompileFingerprint::for_engine(engine, format, world).value()
+}
+
+fn cache_entry_paths(
+    config: &CompiledCacheConfig,
+    digest: &str,
+    fingerprint: &str,
+) -> (PathBuf, PathBuf) {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let prefix = &hex[..2.min(hex.len())];
+    let directory = config
+        .root
+        .join("sha256")
+        .join(prefix)
+        .join(hex)
+        .join(fingerprint);
+    (
+        directory.join("artifact.cwasm"),
+        directory.join("metadata.json"),
+    )
+}
+
+fn remove_cache_entry(cache_path: &Path, metadata_path: &Path) {
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(metadata_path);
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("cache path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&temp, bytes)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temp)?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn evict_compiled_cache(config: &CompiledCacheConfig) {
+    let root = config.root.join("sha256");
+    let mut entries = Vec::new();
+    let Ok(prefixes) = std::fs::read_dir(root) else {
+        return;
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(digests) = std::fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        for digest in digests.flatten() {
+            let Ok(fingerprints) = std::fs::read_dir(digest.path()) else {
+                continue;
+            };
+            for fingerprint in fingerprints.flatten() {
+                let artifact = fingerprint.path().join("artifact.cwasm");
+                if let Ok(metadata) = std::fs::metadata(&artifact) {
+                    entries.push((
+                        metadata
+                            .modified()
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        metadata.len(),
+                        fingerprint.path(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut total = entries.iter().map(|(_, size, _)| *size).sum::<u64>();
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in entries {
+        if total <= config.max_bytes {
+            break;
+        }
+        let _ = std::fs::remove_dir_all(path);
+        total = total.saturating_sub(size);
+    }
+}
+
+fn compiled_cache_entry(
+    config: &CompiledCacheConfig,
+    engine: &Engine,
+    source: &[u8],
+    format: ArtifactFormat,
+    world: &str,
+) -> Result<CompiledCacheEntry> {
+    let digest = artifact_digest(source);
+    let fingerprint = engine_fingerprint(engine, format, world);
+    let (cache_path, metadata_path) = cache_entry_paths(config, &digest, &fingerprint);
+    let restore_started = Instant::now();
+    if let (Ok(metadata_bytes), Ok(bytes)) =
+        (std::fs::read(&metadata_path), std::fs::read(&cache_path))
+    {
+        let valid = serde_json::from_slice::<CompiledCacheMetadata>(&metadata_bytes)
+            .map(|metadata| {
+                metadata.schema_version == COMPILED_CACHE_SCHEMA
+                    && metadata.artifact_digest == digest
+                    && metadata.fingerprint == fingerprint
+                    && metadata.wasmtime == WASMTIME_VERSION
+                    && metadata.target
+                        == format!(
+                            "{}-{}-{}",
+                            std::env::consts::ARCH,
+                            std::env::consts::OS,
+                            std::env::consts::FAMILY
+                        )
+                    && metadata.architecture == std::env::consts::ARCH
+                    && metadata.format == format.to_string()
+                    && metadata.world == world
+                    && metadata.wasm_size_bytes == source.len() as u64
+                    && metadata.compiled_size_bytes == bytes.len() as u64
+            })
+            .unwrap_or(false);
+        if valid && !bytes.is_empty() {
+            return Ok(CompiledCacheEntry {
+                bytes,
+                source: CompiledCacheSource::WarmRestored,
+                compile_duration: Duration::ZERO,
+                restore_duration: restore_started.elapsed(),
+                publication_duration: Duration::ZERO,
+            });
+        }
+        remove_cache_entry(&cache_path, &metadata_path);
+    }
+
+    let compile_started = Instant::now();
+    let bytes = match format {
+        ArtifactFormat::Component => engine.precompile_component(source)?,
+        ArtifactFormat::CoreModule => engine.precompile_module(source)?,
+    };
+    let compile_duration = compile_started.elapsed();
+    let publication_started = Instant::now();
+    let metadata = CompiledCacheMetadata {
+        schema_version: COMPILED_CACHE_SCHEMA,
+        artifact_digest: digest,
+        fingerprint: fingerprint.clone(),
+        wasmtime: WASMTIME_VERSION.to_owned(),
+        target: format!(
+            "{}-{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            std::env::consts::FAMILY
+        ),
+        architecture: std::env::consts::ARCH.to_owned(),
+        format: format.to_string(),
+        world: world.to_owned(),
+        wasm_size_bytes: source.len() as u64,
+        compiled_size_bytes: bytes.len() as u64,
+    };
+    write_atomic(&cache_path, &bytes)?;
+    write_atomic(&metadata_path, &serde_json::to_vec_pretty(&metadata)?)?;
+    evict_compiled_cache(config);
+    Ok(CompiledCacheEntry {
+        bytes,
+        source: CompiledCacheSource::ColdCompiled,
+        compile_duration,
+        restore_duration: Duration::ZERO,
+        publication_duration: publication_started.elapsed(),
+    })
+}
+
 impl PitRuntime {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
@@ -343,18 +636,86 @@ impl PitRuntime {
     }
 
     pub fn prepare(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
-        self.prepare_with_world(artifact, None)
+        self.prepare_with_world(artifact, None, None)
+            .map(|(prepared, _)| prepared)
     }
 
     pub fn prepare_http(&self, artifact: WasmArtifact) -> Result<PreparedArtifact> {
-        self.prepare_with_world(artifact, Some("wasi:http/proxy"))
+        self.prepare_with_world(artifact, Some("wasi:http/proxy"), None)
+            .map(|(prepared, _)| prepared)
+    }
+
+    pub fn prepare_http_cached(
+        &self,
+        artifact: WasmArtifact,
+        cache: &CompiledCacheConfig,
+    ) -> Result<(PreparedArtifact, PreparationReport)> {
+        self.prepare_with_world(artifact, Some("wasi:http/proxy"), Some(cache))
+    }
+
+    pub fn warm_digests(cache: &CompiledCacheConfig) -> Vec<String> {
+        let mut values = Vec::new();
+        let Ok(prefixes) = std::fs::read_dir(cache.root.join("sha256")) else {
+            return values;
+        };
+        for prefix in prefixes.flatten() {
+            let Ok(digests) = std::fs::read_dir(prefix.path()) else {
+                continue;
+            };
+            for digest in digests.flatten() {
+                let Ok(fingerprints) = std::fs::read_dir(digest.path()) else {
+                    continue;
+                };
+                if fingerprints.flatten().any(|entry| {
+                    let directory = entry.path();
+                    let cache_path = directory.join("artifact.cwasm");
+                    let metadata_path = directory.join("metadata.json");
+                    let (Ok(bytes), Ok(metadata_bytes)) =
+                        (std::fs::read(&cache_path), std::fs::read(&metadata_path))
+                    else {
+                        return false;
+                    };
+                    let Ok(metadata) =
+                        serde_json::from_slice::<CompiledCacheMetadata>(&metadata_bytes)
+                    else {
+                        return false;
+                    };
+                    let digest_name = digest.file_name();
+                    let Some(name) = digest_name.to_str() else {
+                        return false;
+                    };
+                    metadata.schema_version == COMPILED_CACHE_SCHEMA
+                        && metadata.artifact_digest == format!("sha256:{name}")
+                        && directory.file_name().and_then(|value| value.to_str())
+                            == Some(metadata.fingerprint.as_str())
+                        && metadata.wasmtime == WASMTIME_VERSION
+                        && metadata.target
+                            == format!(
+                                "{}-{}-{}",
+                                std::env::consts::ARCH,
+                                std::env::consts::OS,
+                                std::env::consts::FAMILY
+                            )
+                        && metadata.architecture == std::env::consts::ARCH
+                        && metadata.compiled_size_bytes == bytes.len() as u64
+                        && !bytes.is_empty()
+                }) && let Some(name) = digest.file_name().to_str()
+                {
+                    values.push(format!("sha256:{name}"));
+                }
+            }
+        }
+        values.sort();
+        values.dedup();
+        values
     }
 
     fn prepare_with_world(
         &self,
         artifact: WasmArtifact,
         requested_world: Option<&str>,
-    ) -> Result<PreparedArtifact> {
+        cache: Option<&CompiledCacheConfig>,
+    ) -> Result<(PreparedArtifact, PreparationReport)> {
         let bytes = match artifact.source() {
             ArtifactSource::Path(path) => {
                 if !path.exists() {
@@ -369,7 +730,7 @@ impl PitRuntime {
             ArtifactSource::Bytes(bytes) => bytes.to_vec(),
         };
         let format = detect_format(&bytes)?;
-        let (module, p1_linker, component, p2_linker, http_pre, http_engine, http_ticker) =
+        let (module, p1_linker, component, p2_linker, http_pre, http_engine, http_ticker, report) =
             match format {
                 ArtifactFormat::CoreModule => (
                     Some(
@@ -382,10 +743,15 @@ impl PitRuntime {
                     None,
                     None,
                     None,
+                    PreparationReport {
+                        readiness: ReadinessState::Cold,
+                        source: CompiledCacheSource::ColdCompiled,
+                        compile_duration: Duration::ZERO,
+                        restore_duration: Duration::ZERO,
+                        cache_publication_duration: Duration::ZERO,
+                    },
                 ),
                 ArtifactFormat::Component => {
-                    let component = Component::new(&self.engine, &bytes)
-                        .context("WASM component preparation failed")?;
                     let mut linker = ComponentLinker::new(&self.engine);
                     let mut sync_wasi_options =
                         wasmtime_wasi::p2::bindings::sync::LinkOptions::default();
@@ -395,8 +761,112 @@ impl PitRuntime {
                         &sync_wasi_options,
                     )
                     .context("failed to link WASI Preview 2")?;
-                    let http_component = Component::new(&self.http_engine, &bytes)
-                        .context("WASM HTTP component preparation failed")?;
+                    let component = cache
+                        .is_none()
+                        .then(|| Component::new(&self.engine, &bytes))
+                        .transpose()
+                        .context("WASM component preparation failed")?;
+                    let http_component = if let Some(cache) = cache {
+                        let entry = compiled_cache_entry(
+                            cache,
+                            &self.http_engine,
+                            &bytes,
+                            format,
+                            requested_world.unwrap_or("component"),
+                        )?;
+                        let mut report = PreparationReport {
+                            readiness: match entry.source {
+                                CompiledCacheSource::WarmRestored => ReadinessState::Warm,
+                                CompiledCacheSource::ColdCompiled => ReadinessState::Cold,
+                            },
+                            source: entry.source,
+                            compile_duration: entry.compile_duration,
+                            restore_duration: entry.restore_duration,
+                            cache_publication_duration: entry.publication_duration,
+                        };
+                        // The deserializer is unsafe because Wasmtime trusts the
+                        // bytes as compiled code. The cache entry was created by
+                        // this exact Wasmtime engine fingerprint, was validated
+                        // against the canonical digest and metadata, and is
+                        // immutable after atomic publication.
+                        let component = match unsafe {
+                            Component::deserialize(&self.http_engine, &entry.bytes)
+                        } {
+                            Ok(component) => component,
+                            Err(error) if entry.source == CompiledCacheSource::WarmRestored => {
+                                let digest = artifact_digest(&bytes);
+                                let fingerprint = engine_fingerprint(
+                                    &self.http_engine,
+                                    format,
+                                    requested_world.unwrap_or("component"),
+                                );
+                                let (cache_path, metadata_path) =
+                                    cache_entry_paths(cache, &digest, &fingerprint);
+                                remove_cache_entry(&cache_path, &metadata_path);
+                                let rebuilt = compiled_cache_entry(
+                                    cache,
+                                    &self.http_engine,
+                                    &bytes,
+                                    format,
+                                    requested_world.unwrap_or("component"),
+                                )?;
+                                report = PreparationReport {
+                                    readiness: ReadinessState::Cold,
+                                    source: rebuilt.source,
+                                    compile_duration: rebuilt.compile_duration,
+                                    restore_duration: rebuilt.restore_duration,
+                                    cache_publication_duration: rebuilt.publication_duration,
+                                };
+                                unsafe { Component::deserialize(&self.http_engine, &rebuilt.bytes) }
+                                    .with_context(|| {
+                                        format!(
+                                            "compiled HTTP component deserialization failed after cache rebuild: {error}"
+                                        )
+                                    })?
+                            }
+                            Err(error) => {
+                                return Err(error)
+                                    .context("compiled HTTP component deserialization failed");
+                            }
+                        };
+                        let mut http_linker = ComponentLinker::new(&self.http_engine);
+                        let mut async_wasi_options =
+                            wasmtime_wasi::p2::bindings::LinkOptions::default();
+                        async_wasi_options.cli_exit_with_code(true);
+                        wasmtime_wasi::p2::add_to_linker_with_options_async(
+                            &mut http_linker,
+                            &async_wasi_options,
+                        )
+                        .context("failed to link WASI Preview 2 HTTP base")?;
+                        service_bindings::ServiceConsumer::add_to_linker::<
+                            _,
+                            wasmtime::component::HasSelf<_>,
+                        >(&mut http_linker, |state| state)
+                        .context("failed to link PitFast service capability")?;
+                        wasmtime_wasi_http::add_only_http_to_linker_async(&mut http_linker)
+                            .context("failed to link WASI HTTP")?;
+                        let http_pre = wasmtime_wasi_http::bindings::ProxyPre::new(
+                            http_linker.instantiate_pre(&component)?,
+                        )?;
+                        return Ok((
+                            PreparedArtifact {
+                                engine: self.engine.clone(),
+                                module: None,
+                                p1_linker: None,
+                                component: None,
+                                p2_linker: None,
+                                http_pre: Some(http_pre),
+                                http_engine: Some(self.http_engine.clone()),
+                                http_ticker: Some(Arc::clone(&self.http_ticker)),
+                                artifact,
+                                ticker: Arc::clone(&self.ticker),
+                            },
+                            report,
+                        ));
+                    } else {
+                        Component::new(&self.http_engine, &bytes)
+                            .context("WASM HTTP component preparation failed")?
+                    };
                     let mut http_linker = ComponentLinker::new(&self.http_engine);
                     let mut async_wasi_options =
                         wasmtime_wasi::p2::bindings::LinkOptions::default();
@@ -424,26 +894,36 @@ impl PitRuntime {
                     (
                         None,
                         None,
-                        Some(component),
+                        Some(component.expect("uncached component was prepared")),
                         Some(linker),
                         http_pre,
                         Some(self.http_engine.clone()),
                         Some(Arc::clone(&self.http_ticker)),
+                        PreparationReport {
+                            readiness: ReadinessState::Cold,
+                            source: CompiledCacheSource::ColdCompiled,
+                            compile_duration: Duration::ZERO,
+                            restore_duration: Duration::ZERO,
+                            cache_publication_duration: Duration::ZERO,
+                        },
                     )
                 }
             };
-        Ok(PreparedArtifact {
-            engine: self.engine.clone(),
-            module,
-            p1_linker,
-            component,
-            p2_linker,
-            http_pre,
-            http_engine,
-            http_ticker,
-            artifact,
-            ticker: Arc::clone(&self.ticker),
-        })
+        Ok((
+            PreparedArtifact {
+                engine: self.engine.clone(),
+                module,
+                p1_linker,
+                component,
+                p2_linker,
+                http_pre,
+                http_engine,
+                http_ticker,
+                artifact,
+                ticker: Arc::clone(&self.ticker),
+            },
+            report,
+        ))
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<PreparedArtifact> {
@@ -472,7 +952,7 @@ impl PreparedArtifact {
     }
 
     pub fn default_entrypoint(&self) -> &'static str {
-        if self.component.is_some() {
+        if self.component.is_some() || self.http_pre.is_some() {
             pit_artifact::WASI_PREVIEW2_ENTRYPOINT
         } else {
             pit_artifact::WASI_PREVIEW1_ENTRYPOINT
@@ -1418,10 +1898,12 @@ impl StdoutStream for CapturedOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancellationToken, ExecutionLimits, ExecutionRequest, ExecutionStatus, PitRuntime,
-        PreparedArtifact, WasmArtifact,
+        ArtifactFormat, CancellationToken, CompiledCacheConfig, CompiledCacheSource,
+        ExecutionLimits, ExecutionRequest, ExecutionStatus, PitRuntime, PreparedArtifact,
+        WasmArtifact, cache_entry_paths, compiled_cache_entry,
     };
     use std::time::Duration;
+    use wasmtime::{Config, Engine};
 
     fn prepared_request(source: &str) -> (PreparedArtifact, ExecutionRequest) {
         let bytes = wat::parse_str(source).expect("test WAT must compile");
@@ -1499,6 +1981,79 @@ mod tests {
         assert!(!clone.is_cancelled());
         token.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn compiled_cache_rejects_metadata_and_size_mismatches() {
+        let root = std::env::temp_dir().join(format!(
+            "pitfast-compiled-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = CompiledCacheConfig::new(&root);
+        let bytes =
+            wat::parse_str("(module (func (export \"f\")))").expect("test module should compile");
+        let mut config = Config::new();
+        config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+        let engine = Engine::new(&config).expect("test engine should initialize");
+
+        let first = compiled_cache_entry(
+            &cache,
+            &engine,
+            &bytes,
+            ArtifactFormat::CoreModule,
+            "wasi:cli/command",
+        )
+        .expect("first compilation should succeed");
+        assert_eq!(first.source, CompiledCacheSource::ColdCompiled);
+        assert_eq!(
+            PitRuntime::warm_digests(&cache),
+            vec![super::artifact_digest(&bytes)]
+        );
+        let second = compiled_cache_entry(
+            &cache,
+            &engine,
+            &bytes,
+            ArtifactFormat::CoreModule,
+            "wasi:cli/command",
+        )
+        .expect("cache restore should succeed");
+        assert_eq!(second.source, CompiledCacheSource::WarmRestored);
+
+        let digest = super::artifact_digest(&bytes);
+        let fingerprint =
+            super::engine_fingerprint(&engine, ArtifactFormat::CoreModule, "wasi:cli/command");
+        let (cache_path, metadata_path) = cache_entry_paths(&cache, &digest, &fingerprint);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata should exist"))
+                .expect("metadata should be JSON");
+        metadata["fingerprint"] = serde_json::Value::String("wrong".to_owned());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata).expect("metadata should serialize"),
+        )
+        .expect("metadata should be writable");
+        let third = compiled_cache_entry(
+            &cache,
+            &engine,
+            &bytes,
+            ArtifactFormat::CoreModule,
+            "wasi:cli/command",
+        )
+        .expect("metadata mismatch should rebuild");
+        assert_eq!(third.source, CompiledCacheSource::ColdCompiled);
+
+        std::fs::write(&cache_path, [0_u8]).expect("compiled cache should be writable");
+        let fourth = compiled_cache_entry(
+            &cache,
+            &engine,
+            &bytes,
+            ArtifactFormat::CoreModule,
+            "wasi:cli/command",
+        )
+        .expect("size mismatch should rebuild");
+        assert_eq!(fourth.source, CompiledCacheSource::ColdCompiled);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

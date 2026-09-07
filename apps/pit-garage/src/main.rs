@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -20,11 +21,13 @@ use pit_circuit_core::{
     GarageCapabilities, GarageId, GarageSessionId, HeartbeatRequest, LogicalInvocationRequest,
     LogicalInvocationResponse, REMOTE_PROTOCOL_VERSION, RegisterGarageRequest,
     RegisterGarageResponse, RemoteExecutionError, RemoteExecutionRequest, RemoteExecutionResponse,
-    RuntimeContract,
+    RemoteExecutionTiming, RuntimeContract,
 };
 use pit_deployment::{ArtifactAcquirer, LocalArtifactStore};
 use pit_lane_core::{ServiceInvocationRequest, ServiceInvocationResponse, ServiceInvoker};
-use pit_node::{CancellationToken, ExecutionLimits, HttpRequest, PitHttpDispatcher};
+use pit_node::{
+    CancellationToken, CompiledCacheSource, ExecutionLimits, HttpRequest, PitHttpDispatcher,
+};
 use pit_paddock_core::PaddockBackend;
 use pit_paddock_factory::PaddockConfig;
 use pit_paddock_fs::FilesystemPaddock;
@@ -70,6 +73,10 @@ struct Args {
     max_pending: usize,
     #[arg(long, default_value_t = 16)]
     max_invocation_depth: u16,
+    #[arg(long)]
+    compiled_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 2)]
+    max_preparations: usize,
 }
 
 struct GarageAgent {
@@ -89,10 +96,20 @@ struct GarageAgent {
     max_invocation_depth: u16,
     remote_acquisitions: AtomicUsize,
     preparations: AtomicUsize,
+    compilations: AtomicUsize,
+    warm_restores: AtomicUsize,
+    cache_publications: AtomicUsize,
     executions: AtomicUsize,
+    preparation_budget: Arc<Semaphore>,
 }
 
-type WarmupMap = Mutex<HashMap<String, Arc<OnceCell<std::result::Result<(), String>>>>>;
+#[derive(Debug, Clone)]
+struct WarmupReport {
+    preparation: pit_node::PreparationReport,
+    duration: Duration,
+}
+
+type WarmupMap = Mutex<HashMap<String, Arc<OnceCell<std::result::Result<WarmupReport, String>>>>>;
 
 impl GarageAgent {
     fn new(args: &Args) -> Result<Self> {
@@ -110,12 +127,19 @@ impl GarageAgent {
         let blocking_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
+        let compiled_cache = match &args.compiled_cache {
+            Some(path) => path.clone(),
+            None => pit_node::CompiledCacheConfig::default_root()?,
+        };
         Ok(Self {
             id: args.id.clone(),
             endpoint: args.listen.to_string(),
             circuit_endpoint: args.circuit.trim_end_matches('/').to_owned(),
             pitlane_endpoint: args.pitlane.trim_end_matches('/').to_owned(),
-            dispatcher: Arc::new(PitHttpDispatcher::with_lanes(args.lanes)?),
+            dispatcher: Arc::new(PitHttpDispatcher::with_compiled_cache(
+                args.lanes,
+                &compiled_cache,
+            )?),
             artifact_store,
             paddock_name: args.paddock.clone(),
             paddock,
@@ -127,7 +151,11 @@ impl GarageAgent {
             max_invocation_depth: args.max_invocation_depth,
             remote_acquisitions: AtomicUsize::new(0),
             preparations: AtomicUsize::new(0),
+            compilations: AtomicUsize::new(0),
+            warm_restores: AtomicUsize::new(0),
+            cache_publications: AtomicUsize::new(0),
             executions: AtomicUsize::new(0),
+            preparation_budget: Arc::new(Semaphore::new(args.max_preparations.max(1))),
         })
     }
 
@@ -199,6 +227,8 @@ impl GarageAgent {
                 accepting: self.pending.available_permits() > 0,
                 local_artifacts: self.local_digests(),
                 prepared_artifacts: self.prepared_digests(),
+                warm_artifacts: self.warm_digests(),
+                hot_artifacts: self.prepared_digests(),
                 capabilities: self.capabilities(),
             })
             .send()
@@ -251,11 +281,19 @@ impl GarageAgent {
             .collect()
     }
 
+    fn warm_digests(&self) -> Vec<pit_paddock_core::ArtifactDigest> {
+        self.dispatcher
+            .warm_keys()
+            .into_iter()
+            .filter_map(|key| key.parse().ok())
+            .collect()
+    }
+
     async fn warmup(
         &self,
         digest: &pit_paddock_core::ArtifactDigest,
         source_paddock: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<WarmupReport> {
         let key = digest.to_string();
         let cell = {
             let mut warmups = self.warmups.lock().unwrap();
@@ -271,7 +309,7 @@ impl GarageAgent {
             })
             .await;
         match result {
-            Ok(()) => Ok(()),
+            Ok(report) => Ok(report.clone()),
             Err(error) => {
                 self.warmups.lock().unwrap().remove(&key);
                 bail!("{error}")
@@ -283,7 +321,26 @@ impl GarageAgent {
         &self,
         digest: &pit_paddock_core::ArtifactDigest,
         source_paddock: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<WarmupReport> {
+        let started = Instant::now();
+        if self.dispatcher.has_prepared(&digest.to_string()) {
+            return Ok(WarmupReport {
+                preparation: pit_node::PreparationReport {
+                    readiness: pit_node::ReadinessState::Hot,
+                    source: CompiledCacheSource::WarmRestored,
+                    compile_duration: Duration::ZERO,
+                    restore_duration: Duration::ZERO,
+                    cache_publication_duration: Duration::ZERO,
+                },
+                duration: started.elapsed(),
+            });
+        }
+        let _preparation_permit = self
+            .preparation_budget
+            .clone()
+            .acquire_owned()
+            .await
+            .context("preparation budget closed")?;
         let (_manifest, artifact_path) = match self.artifact_store.open(digest) {
             Ok(value) => value,
             Err(_) => {
@@ -302,20 +359,33 @@ impl GarageAgent {
                 (acquisition.manifest, acquisition.artifact_path)
             }
         };
-        if !self.dispatcher.has_prepared(&digest.to_string()) {
-            self.preparations.fetch_add(1, Ordering::Relaxed);
-            let dispatcher = Arc::clone(&self.dispatcher);
-            let path = artifact_path.clone();
-            let key = digest.to_string();
-            tokio::task::spawn_blocking(move || {
-                dispatcher.register(key, pit_node::WasmArtifact::from_path(&path))
-            })
-            .await??;
+        self.preparations.fetch_add(1, Ordering::Relaxed);
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let path = artifact_path.clone();
+        let key = digest.to_string();
+        let report = tokio::task::spawn_blocking(move || {
+            dispatcher.register_with_report(key, pit_node::WasmArtifact::from_path(&path))
+        })
+        .await??;
+        match report.source {
+            CompiledCacheSource::ColdCompiled => {
+                self.compilations.fetch_add(1, Ordering::Relaxed);
+            }
+            CompiledCacheSource::WarmRestored => {
+                self.warm_restores.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        Ok(())
+        if report.cache_publication_duration > Duration::ZERO {
+            self.cache_publications.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(WarmupReport {
+            preparation: report,
+            duration: started.elapsed(),
+        })
     }
 
     async fn execute(&self, request: RemoteExecutionRequest) -> RemoteExecutionResponse {
+        let request_started = Instant::now();
         let base = RemoteExecutionResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             accepted: false,
@@ -326,6 +396,7 @@ impl GarageAgent {
             guest_status: None,
             headers: Vec::new(),
             body: Vec::new(),
+            timing: None,
             error: None,
             error_message: None,
         };
@@ -364,16 +435,19 @@ impl GarageAgent {
                 "Garage admission limit exceeded",
             );
         };
-        if let Err(error) = self
+        let warmup = match self
             .warmup(&request.artifact_digest, request.source_paddock.as_deref())
             .await
         {
-            return failure(
-                base,
-                RemoteExecutionError::ArtifactUnavailable,
-                &error.to_string(),
-            );
-        }
+            Ok(report) => report,
+            Err(error) => {
+                return failure(
+                    base,
+                    RemoteExecutionError::ArtifactUnavailable,
+                    &error.to_string(),
+                );
+            }
+        };
         let mut visited = request.visited_garages.clone();
         visited.push(self.id.clone());
         let http_request = HttpRequest {
@@ -445,6 +519,16 @@ impl GarageAgent {
                 response.error_message = result.error;
             }
         }
+        response.timing = Some(RemoteExecutionTiming {
+            preparation_us: warmup.duration.as_micros(),
+            compile_us: warmup.preparation.compile_duration.as_micros(),
+            restore_us: warmup.preparation.restore_duration.as_micros(),
+            prepared_lookup_us: result.prepared_lookup.as_micros(),
+            scheduler_queue_us: result.queued_for.as_micros(),
+            guest_started_us: result.guest_started_after_request.as_micros(),
+            guest_execution_us: result.duration.as_micros(),
+            total_us: request_started.elapsed().as_micros(),
+        });
         response
     }
 
@@ -487,7 +571,7 @@ impl GarageAgent {
             }
             (Method::GET, "/v1/runtime") => {
                 let live = self.dispatcher.scheduler_snapshot();
-                json_response(StatusCode::OK, &serde_json::json!({"garage_id": self.id, "total_lanes": live.lane_count, "active_lanes": live.running, "free_lanes": live.lane_count.saturating_sub(live.running), "queue_depth": live.queued, "local_artifacts": self.local_digests(), "prepared_artifacts": self.prepared_digests(), "remote_acquisitions": self.remote_acquisitions.load(Ordering::Relaxed), "preparations": self.preparations.load(Ordering::Relaxed), "executions": self.executions.load(Ordering::Relaxed)})).unwrap()
+                json_response(StatusCode::OK, &serde_json::json!({"garage_id": self.id, "total_lanes": live.lane_count, "active_lanes": live.running, "free_lanes": live.lane_count.saturating_sub(live.running), "queue_depth": live.queued, "grid_utilization": self.dispatcher.grid_utilization(), "local_artifacts": self.local_digests(), "warm_artifacts": self.warm_digests(), "prepared_artifacts": self.prepared_digests(), "hot_artifacts": self.prepared_digests(), "remote_acquisitions": self.remote_acquisitions.load(Ordering::Relaxed), "preparations": self.preparations.load(Ordering::Relaxed), "compilations": self.compilations.load(Ordering::Relaxed), "warm_restores": self.warm_restores.load(Ordering::Relaxed), "cache_publications": self.cache_publications.load(Ordering::Relaxed), "executions": self.executions.load(Ordering::Relaxed)})).unwrap()
             }
             _ => error_response(StatusCode::NOT_FOUND, "unknown Garage operation"),
         }
