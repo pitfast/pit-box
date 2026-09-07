@@ -1565,25 +1565,35 @@ impl PreparedArtifact {
                     .await;
                 (store, result)
             });
-            // Wait for the guest handler before consuming the response body.
-            // This keeps a guest that is itself consuming an outgoing response
-            // from being coupled to the host's collection of its outer body.
+            // Consume the response body while the guest is still running. The
+            // WASI HTTP outgoing stream is bounded; waiting for the guest
+            // before draining it deadlocks any legitimate response larger than
+            // the stream buffer (for example a real frontend JavaScript asset).
+            let response_task = tokio::spawn(async move {
+                let response = receiver
+                    .await
+                    .map_err(|_| anyhow!("HTTP guest dropped response output"))??;
+                let status = response.status().as_u16();
+                let headers = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let body = response.into_body().collect().await?.to_bytes().to_vec();
+                Ok::<_, anyhow::Error>(HttpResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            });
             let (store, call_result) = handler.await;
             if let Err(error) = call_result {
+                response_task.abort();
                 return Err(anyhow!("WASI HTTP incoming handler failed: {error:#}"));
             }
-            let response = receiver
-                .await
-                .map_err(|_| anyhow!("HTTP guest dropped response output"))??;
-            let status = response.status().as_u16();
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    Ok::<_, anyhow::Error>((name.to_string(), value.to_str()?.to_owned()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let body = response.into_body().collect().await?.to_bytes().to_vec();
+            let response = response_task.await??;
             match control.signal() {
                 ControlSignal::Cancelled => bail!("HTTP execution was cancelled"),
                 ControlSignal::TimedOut => bail!("HTTP execution exceeded its timeout"),
@@ -1593,11 +1603,7 @@ impl PreparedArtifact {
                 ControlSignal::None => {}
             }
             Ok((
-                HttpResponse {
-                    status,
-                    headers,
-                    body,
-                },
+                response,
                 HttpExecutionTimings {
                     request_setup,
                     wasi_setup,
@@ -1842,6 +1848,15 @@ impl WasiHttpView for HttpHostState {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
+
+    fn outgoing_body_buffer_chunks(&mut self) -> usize {
+        // Component handlers publish the response outparam only after they
+        // finish writing the response body. Keep enough bounded capacity for
+        // the host to accept ordinary frontend assets before that publication;
+        // the PitLane response limit still bounds total response memory.
+        4096
+    }
+
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
