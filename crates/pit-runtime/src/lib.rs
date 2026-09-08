@@ -2462,8 +2462,8 @@ fn verify_gateway_signature(state: &HttpHostState) -> std::result::Result<(), St
     let parts = authorization
         .strip_prefix("AWS4-HMAC-SHA256 ")
         .ok_or_else(|| "unsupported authorization scheme".to_owned())?
-        .split(", ")
-        .filter_map(|part| part.split_once('='))
+        .split(',')
+        .filter_map(|part| part.trim().split_once('='))
         .collect::<std::collections::HashMap<_, _>>();
     let credential = parts
         .get("Credential")
@@ -2513,12 +2513,12 @@ fn verify_gateway_signature(state: &HttpHostState) -> std::result::Result<(), St
     }
     let payload_hash = header_value(state, "x-amz-content-sha256")
         .unwrap_or_else(|| state.request_payload_hash.clone());
-    if payload_hash != "UNSIGNED-PAYLOAD" && payload_hash != state.request_payload_hash {
+    if !accepted_payload_hash(&payload_hash, &state.request_payload_hash) {
         return Err("x-amz-content-sha256 does not match the request body".into());
     }
     let (canonical_uri, canonical_query) = canonical_path_and_query(&state.request_path)?;
     let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}{}\n{}",
         state.request_method.to_uppercase(),
         canonical_uri,
         canonical_query,
@@ -2543,6 +2543,17 @@ fn verify_gateway_signature(state: &HttpHostState) -> std::result::Result<(), St
         return Err("signature does not match".into());
     }
     Ok(())
+}
+
+fn accepted_payload_hash(declared: &str, actual: &str) -> bool {
+    // PitLane presents the gateway with the decoded request body. For the
+    // AWS SDK's aws-chunked transport, the wire-level per-chunk signatures are
+    // therefore not available here; accepting this marker authenticates the
+    // request-level SigV4 envelope and is deliberately documented as an alpha
+    // limitation rather than claimed as full streaming SigV4 verification.
+    declared == "UNSIGNED-PAYLOAD"
+        || declared == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        || declared == actual
 }
 
 struct HostState {
@@ -2735,8 +2746,8 @@ mod tests {
         ArtifactFormat, ArtifactSource, CancellationToken, CompiledCacheConfig,
         CompiledCacheRestoreMode, CompiledCacheSource, ExecutionLimits, ExecutionRequest,
         ExecutionStatus, PitRuntime, PitRuntimeConfig, PreparedArtifact, RuntimeAllocationMode,
-        WasmArtifact, cache_entry_paths, canonical_path_and_query, compiled_cache_entry,
-        parse_amz_timestamp,
+        WasmArtifact, accepted_payload_hash, cache_entry_paths, canonical_path_and_query,
+        compiled_cache_entry, parse_amz_timestamp,
     };
     use std::time::Duration;
     use wasmtime::{Config, Engine};
@@ -2774,6 +2785,18 @@ mod tests {
             .expect("canonical path should be valid");
         assert_eq!(path, "/a%20space/utf8");
         assert_eq!(query, "a=1&b=2&q=z%20value");
+    }
+
+    #[test]
+    fn sigv4_accepts_client_streaming_payload_marker() {
+        assert!(accepted_payload_hash(
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "sha256:request-body"
+        ));
+        assert!(!accepted_payload_hash(
+            "sha256:other",
+            "sha256:request-body"
+        ));
     }
 
     #[test]
