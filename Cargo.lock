@@ -852,6 +852,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,6 +883,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -1747,6 +1759,7 @@ dependencies = [
  "pit-artifact",
  "pit-paddock-core",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
@@ -1756,10 +1769,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
+ "futures-util",
  "pit-artifact",
  "pit-paddock-core",
  "s3",
  "serde_json",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
@@ -1767,12 +1784,14 @@ name = "pit-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "http",
  "http-body-util",
  "hyper",
  "pit-artifact",
  "pit-lane-core",
+ "pit-paddock-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",

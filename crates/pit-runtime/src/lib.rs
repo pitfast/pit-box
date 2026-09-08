@@ -18,6 +18,10 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use pit_artifact::ArtifactFormat;
 use pit_lane_core::{PitUri, ServiceInvocationRequest, ServiceInvoker};
+use pit_paddock_core::{
+    NamespaceId, ObjectKey, ObjectMetadata, ObjectRef, ObjectWriter, PaddockGrant,
+    PaddockObjectBackend,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
@@ -36,11 +40,25 @@ use wasmtime_wasi_http::types::IncomingResponse;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::{HttpError, HttpResult, WasiHttpCtx, WasiHttpView};
 
+pub struct PaddockWriterState {
+    writer: Option<Box<dyn ObjectWriter>>,
+}
+
 mod service_bindings {
     wasmtime::component::bindgen!({
         path: "../../../pit-lane/crates/pit-lane-core/wit",
         world: "service-consumer",
         imports: { default: async },
+        require_store_data_send: true,
+    });
+}
+
+mod paddock_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../../pit-lane/crates/pit-lane-core/wit/paddock",
+        world: "paddock-consumer",
+        imports: { default: async },
+        with: { "pitfast:paddock/store.writer": crate::PaddockWriterState },
         require_store_data_send: true,
     });
 }
@@ -318,7 +336,7 @@ impl Default for PitRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: String,
     pub path_and_query: String,
@@ -337,6 +355,10 @@ pub struct HttpRequest {
     /// Immutable application release context captured at ingress.
     pub application_id: Option<String>,
     pub release_id: Option<String>,
+    /// Optional host-owned generic Paddock capability for this invocation.
+    /// The guest never receives backend credentials or filesystem paths.
+    pub paddock: Option<Arc<dyn PaddockObjectBackend>>,
+    pub paddock_grants: Vec<PaddockGrant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1068,6 +1090,11 @@ impl PitRuntime {
                             wasmtime::component::HasSelf<_>,
                         >(&mut http_linker, |state| state)
                         .context("failed to link PitFast service capability")?;
+                        paddock_bindings::PaddockConsumer::add_to_linker::<
+                            _,
+                            wasmtime::component::HasSelf<_>,
+                        >(&mut http_linker, |state| state)
+                        .context("failed to link generic Paddock capability")?;
                         wasmtime_wasi_http::add_only_http_to_linker_async(&mut http_linker)
                             .context("failed to link WASI HTTP")?;
                         report.http_linker_setup_duration = http_linker_started.elapsed();
@@ -1119,6 +1146,11 @@ impl PitRuntime {
                         wasmtime::component::HasSelf<_>,
                     >(&mut http_linker, |state| state)
                     .context("failed to link PitFast service capability")?;
+                    paddock_bindings::PaddockConsumer::add_to_linker::<
+                        _,
+                        wasmtime::component::HasSelf<_>,
+                    >(&mut http_linker, |state| state)
+                    .context("failed to link generic Paddock capability")?;
                     wasmtime_wasi_http::add_only_http_to_linker_async(&mut http_linker)
                         .context("failed to link WASI HTTP")?;
                     let http_pre = requested_world
@@ -1514,6 +1546,8 @@ impl PreparedArtifact {
                     visited_garages: request.visited_garages.clone(),
                     application_id: request.application_id.clone(),
                     release_id: request.release_id.clone(),
+                    paddock: request.paddock.clone(),
+                    paddock_grants: request.paddock_grants.clone(),
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1821,6 +1855,8 @@ struct HttpHostState {
     visited_garages: Vec<String>,
     application_id: Option<String>,
     release_id: Option<String>,
+    paddock: Option<Arc<dyn PaddockObjectBackend>>,
+    paddock_grants: Vec<PaddockGrant>,
 }
 
 impl WasiView for P2HostState {
@@ -2021,6 +2057,244 @@ impl service_bindings::pitfast::service::invoke::Host for HttpHostState {
                 .collect(),
             body: response.body.to_vec(),
         })
+    }
+}
+
+fn paddock_error(error: anyhow::Error) -> paddock_bindings::pitfast::paddock::store::Error {
+    paddock_bindings::pitfast::paddock::store::Error::Unavailable(error.to_string())
+}
+
+fn paddock_granted(state: &HttpHostState, namespace: &NamespaceId, write: bool) -> bool {
+    state
+        .paddock_grants
+        .iter()
+        .any(|grant| grant.allows(namespace, write))
+}
+
+fn to_paddock_object(object: ObjectRef) -> paddock_bindings::pitfast::paddock::store::ObjectRef {
+    paddock_bindings::pitfast::paddock::store::ObjectRef {
+        namespace: object.namespace.to_string(),
+        key: object.key.to_string(),
+        version: object.version.get(),
+        digest: object.digest.to_string(),
+        size: object.size.get(),
+        content_type: object.metadata.content_type,
+        deleted: object.deleted,
+    }
+}
+
+impl paddock_bindings::pitfast::paddock::store::Host for HttpHostState {
+    async fn begin_write(
+        &mut self,
+        namespace: String,
+        key: String,
+        content_type: Option<String>,
+    ) -> std::result::Result<
+        wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
+        paddock_bindings::pitfast::paddock::store::Error,
+    > {
+        let namespace = NamespaceId::new(namespace).map_err(paddock_error)?;
+        let key = ObjectKey::new(key).map_err(paddock_error)?;
+        if !paddock_granted(self, &namespace, true) {
+            return Err(paddock_bindings::pitfast::paddock::store::Error::Denied(
+                format!("write access denied for namespace {namespace}"),
+            ));
+        }
+        let backend = self.paddock.as_ref().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Unavailable(
+                "Paddock capability is not configured".into(),
+            )
+        })?;
+        let metadata = ObjectMetadata {
+            content_type,
+            ..Default::default()
+        };
+        let writer = backend
+            .begin_object_write(namespace, key, metadata, None)
+            .await
+            .map_err(paddock_error)?;
+        self.table
+            .push(PaddockWriterState {
+                writer: Some(writer),
+            })
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))
+    }
+
+    async fn get(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> std::result::Result<
+        paddock_bindings::pitfast::paddock::store::ObjectRef,
+        paddock_bindings::pitfast::paddock::store::Error,
+    > {
+        let namespace = NamespaceId::new(namespace).map_err(paddock_error)?;
+        let key = ObjectKey::new(key).map_err(paddock_error)?;
+        if !paddock_granted(self, &namespace, false) {
+            return Err(paddock_bindings::pitfast::paddock::store::Error::Denied(
+                format!("read access denied for namespace {namespace}"),
+            ));
+        }
+        let backend = self.paddock.as_ref().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Unavailable(
+                "Paddock capability is not configured".into(),
+            )
+        })?;
+        backend
+            .get_object(&namespace, &key, None)
+            .await
+            .map(to_paddock_object)
+            .map_err(paddock_error)
+    }
+
+    async fn read_range(
+        &mut self,
+        namespace: String,
+        key: String,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<Vec<u8>, paddock_bindings::pitfast::paddock::store::Error> {
+        let namespace = NamespaceId::new(namespace).map_err(paddock_error)?;
+        let key = ObjectKey::new(key).map_err(paddock_error)?;
+        if !paddock_granted(self, &namespace, false) {
+            return Err(paddock_bindings::pitfast::paddock::store::Error::Denied(
+                format!("read access denied for namespace {namespace}"),
+            ));
+        }
+        let backend = self.paddock.as_ref().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Unavailable(
+                "Paddock capability is not configured".into(),
+            )
+        })?;
+        let object = backend
+            .get_object(&namespace, &key, None)
+            .await
+            .map_err(paddock_error)?;
+        backend
+            .read_blob_range(&object.digest, offset, length)
+            .await
+            .map_err(paddock_error)
+    }
+
+    async fn delete(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> std::result::Result<(), paddock_bindings::pitfast::paddock::store::Error> {
+        let namespace = NamespaceId::new(namespace).map_err(paddock_error)?;
+        let key = ObjectKey::new(key).map_err(paddock_error)?;
+        let allowed = self
+            .paddock_grants
+            .iter()
+            .any(|grant| grant.namespace == namespace && grant.delete);
+        if !allowed {
+            return Err(paddock_bindings::pitfast::paddock::store::Error::Denied(
+                format!("delete access denied for namespace {namespace}"),
+            ));
+        }
+        let backend = self.paddock.as_ref().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Unavailable(
+                "Paddock capability is not configured".into(),
+            )
+        })?;
+        backend
+            .delete_object(&namespace, &key, None)
+            .await
+            .map_err(paddock_error)
+    }
+
+    async fn list_objects(
+        &mut self,
+        namespace: String,
+        prefix: Option<String>,
+    ) -> std::result::Result<
+        Vec<paddock_bindings::pitfast::paddock::store::ObjectRef>,
+        paddock_bindings::pitfast::paddock::store::Error,
+    > {
+        let namespace = NamespaceId::new(namespace).map_err(paddock_error)?;
+        let allowed = self
+            .paddock_grants
+            .iter()
+            .any(|grant| grant.namespace == namespace && grant.list);
+        if !allowed {
+            return Err(paddock_bindings::pitfast::paddock::store::Error::Denied(
+                format!("list access denied for namespace {namespace}"),
+            ));
+        }
+        let backend = self.paddock.as_ref().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Unavailable(
+                "Paddock capability is not configured".into(),
+            )
+        })?;
+        backend
+            .list_objects(&namespace, prefix.as_deref())
+            .await
+            .map(|objects| objects.into_iter().map(to_paddock_object).collect())
+            .map_err(paddock_error)
+    }
+}
+
+impl paddock_bindings::pitfast::paddock::store::HostWriter for HttpHostState {
+    async fn write(
+        &mut self,
+        resource: wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
+        chunk: Vec<u8>,
+    ) -> std::result::Result<(), paddock_bindings::pitfast::paddock::store::Error> {
+        let writer = self
+            .table
+            .get_mut(&resource)
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))?
+            .writer
+            .as_mut()
+            .ok_or_else(|| {
+                paddock_bindings::pitfast::paddock::store::Error::Conflict(
+                    "writer finalized".into(),
+                )
+            })?;
+        writer.write_chunk(&chunk).await.map_err(paddock_error)
+    }
+
+    async fn commit(
+        &mut self,
+        resource: wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
+    ) -> std::result::Result<
+        paddock_bindings::pitfast::paddock::store::ObjectRef,
+        paddock_bindings::pitfast::paddock::store::Error,
+    > {
+        let mut state = self
+            .table
+            .delete(resource)
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))?;
+        let writer = state.writer.take().ok_or_else(|| {
+            paddock_bindings::pitfast::paddock::store::Error::Conflict("writer finalized".into())
+        })?;
+        writer
+            .commit()
+            .await
+            .map(to_paddock_object)
+            .map_err(paddock_error)
+    }
+
+    async fn abort(
+        &mut self,
+        resource: wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
+    ) -> std::result::Result<(), paddock_bindings::pitfast::paddock::store::Error> {
+        let mut state = self
+            .table
+            .delete(resource)
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))?;
+        if let Some(writer) = state.writer.take() {
+            writer.abort().await.map_err(paddock_error)?;
+        }
+        Ok(())
+    }
+
+    async fn drop(
+        &mut self,
+        resource: wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
+    ) -> wasmtime::Result<()> {
+        let _ = self.table.delete(resource)?;
+        Ok(())
     }
 }
 

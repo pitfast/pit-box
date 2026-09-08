@@ -196,6 +196,8 @@ fn main() -> Result<()> {
         visited_garages: Vec::new(),
         application_id: None,
         release_id: None,
+        paddock: None,
+        paddock_grants: Vec::new(),
     };
     let runtime_config = PitRuntimeConfig {
         compiled_cache_restore: restore_mode,

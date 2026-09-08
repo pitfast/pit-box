@@ -14,6 +14,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 pit-artifact = { path = "../pit-crew/crates/pit-artifact" }
 pit-circuit-core = { path = "../pit-circuit/crates/pit-circuit-core" }

@@ -28,7 +28,7 @@ use pit_lane_core::{ServiceInvocationRequest, ServiceInvocationResponse, Service
 use pit_node::{
     CancellationToken, CompiledCacheSource, ExecutionLimits, HttpRequest, PitHttpDispatcher,
 };
-use pit_paddock_core::PaddockBackend;
+use pit_paddock_core::{NamespaceId, PaddockBackend, PaddockGrant, PaddockObjectBackend};
 use pit_paddock_factory::PaddockConfig;
 use pit_paddock_fs::FilesystemPaddock;
 use reqwest::Client;
@@ -77,6 +77,9 @@ struct Args {
     compiled_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     max_preparations: usize,
+    /// Explicit namespace granted to the generic Paddock capability.
+    #[arg(long)]
+    paddock_namespace: Option<String>,
 }
 
 struct GarageAgent {
@@ -88,6 +91,8 @@ struct GarageAgent {
     artifact_store: LocalArtifactStore,
     paddock_name: String,
     paddock: Option<Arc<dyn PaddockBackend>>,
+    object_paddock: Option<Arc<dyn PaddockObjectBackend>>,
+    paddock_grants: Vec<PaddockGrant>,
     warmups: WarmupMap,
     pending: Arc<Semaphore>,
     client: Client,
@@ -123,6 +128,20 @@ impl GarageAgent {
             let config = PaddockConfig::load(Path::new("."))?;
             Some(config.open(&args.paddock, None)?)
         };
+        let object_paddock: Option<Arc<dyn PaddockObjectBackend>> =
+            if let Some(root) = &args.paddock_dir {
+                Some(Arc::new(FilesystemPaddock::new(root.clone())))
+            } else {
+                let config = PaddockConfig::load(Path::new("."))?;
+                Some(config.open_objects(&args.paddock, None)?)
+            };
+        let paddock_grants = args
+            .paddock_namespace
+            .as_deref()
+            .map(NamespaceId::new)
+            .transpose()?
+            .map(|namespace| vec![PaddockGrant::full(namespace)])
+            .unwrap_or_default();
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
         let blocking_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -143,6 +162,8 @@ impl GarageAgent {
             artifact_store,
             paddock_name: args.paddock.clone(),
             paddock,
+            object_paddock,
+            paddock_grants,
             warmups: Mutex::new(HashMap::new()),
             pending: Arc::new(Semaphore::new(args.max_pending)),
             client,
@@ -462,6 +483,8 @@ impl GarageAgent {
             visited_garages: visited.into_iter().map(|id| id.to_string()).collect(),
             application_id: request.application_id.clone(),
             release_id: request.release_id.clone(),
+            paddock: self.object_paddock.clone(),
+            paddock_grants: self.paddock_grants.clone(),
         };
         self.executions.fetch_add(1, Ordering::Relaxed);
         let dispatcher = Arc::clone(&self.dispatcher);
