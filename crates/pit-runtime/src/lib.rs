@@ -2384,24 +2384,51 @@ fn aws_percent_encode(value: &[u8]) -> String {
         .collect()
 }
 
+fn percent_decode(value: &str) -> Result<Vec<u8>, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err("invalid percent-encoding".into());
+        }
+        let digit = |byte: u8| match byte.to_ascii_lowercase() {
+            lower @ b'0'..=b'9' => Some(lower - b'0'),
+            lower @ b'a'..=b'f' => Some(lower - b'a' + 10),
+            _ => None,
+        };
+        let (Some(high), Some(low)) = (digit(bytes[index + 1]), digit(bytes[index + 2])) else {
+            return Err("invalid percent-encoding".into());
+        };
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
 fn canonical_path_and_query(path: &str) -> Result<(String, String), String> {
     let (raw_path, raw_query) = path.split_once('?').unwrap_or((path, ""));
     let canonical_path = raw_path
         .split('/')
-        .map(|part| aws_percent_encode(part.as_bytes()))
-        .collect::<Vec<_>>()
+        .map(|part| percent_decode(part).map(|bytes| aws_percent_encode(&bytes)))
+        .collect::<Result<Vec<_>, _>>()?
         .join("/");
     let mut query = raw_query
         .split('&')
         .filter(|part| !part.is_empty())
         .map(|part| {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            (
-                aws_percent_encode(key.as_bytes()),
-                aws_percent_encode(value.as_bytes()),
-            )
+            Ok((
+                aws_percent_encode(&percent_decode(key)?),
+                aws_percent_encode(&percent_decode(value)?),
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     query.sort();
     Ok((
         if canonical_path.is_empty() {
@@ -2518,7 +2545,7 @@ fn verify_gateway_signature(state: &HttpHostState) -> std::result::Result<(), St
     }
     let (canonical_uri, canonical_query) = canonical_path_and_query(&state.request_path)?;
     let canonical_request = format!(
-        "{}\n{}\n{}\n{}{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         state.request_method.to_uppercase(),
         canonical_uri,
         canonical_query,
@@ -2785,6 +2812,14 @@ mod tests {
             .expect("canonical path should be valid");
         assert_eq!(path, "/a%20space/utf8");
         assert_eq!(query, "a=1&b=2&q=z%20value");
+    }
+
+    #[test]
+    fn sigv4_does_not_double_encode_transport_escapes() {
+        let (path, query) = canonical_path_and_query("/utf%208/obj?q=a%2Bb")
+            .expect("encoded path and query should be valid");
+        assert_eq!(path, "/utf%208/obj");
+        assert_eq!(query, "q=a%2Bb");
     }
 
     #[test]
