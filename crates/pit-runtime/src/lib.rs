@@ -19,11 +19,12 @@ use http_body_util::{BodyExt, Full};
 use pit_artifact::ArtifactFormat;
 use pit_lane_core::{PitUri, ServiceInvocationRequest, ServiceInvoker};
 use pit_paddock_core::{
-    NamespaceId, ObjectKey, ObjectMetadata, ObjectRef, ObjectWriter, PaddockGrant,
-    PaddockObjectBackend,
+    NamespaceId, ObjectKey, ObjectMetadata, ObjectRef, ObjectWriter, PaddockGatewayAuth,
+    PaddockGrant, PaddockObjectBackend,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::{Date, Month, Time as ClockTime};
 use tokio::io::AsyncWrite;
 use wasmparser::{Encoding, Parser, Payload};
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
@@ -359,6 +360,7 @@ pub struct HttpRequest {
     /// The guest never receives backend credentials or filesystem paths.
     pub paddock: Option<Arc<dyn PaddockObjectBackend>>,
     pub paddock_grants: Vec<PaddockGrant>,
+    pub paddock_auth: Option<PaddockGatewayAuth>,
 }
 
 #[derive(Debug, Clone)]
@@ -1548,6 +1550,11 @@ impl PreparedArtifact {
                     release_id: request.release_id.clone(),
                     paddock: request.paddock.clone(),
                     paddock_grants: request.paddock_grants.clone(),
+                    paddock_auth: request.paddock_auth.clone(),
+                    request_method: request.method.clone(),
+                    request_path: request.path_and_query.clone(),
+                    request_headers: request.headers.clone(),
+                    request_payload_hash: hex_digest(Sha256::digest(&request.body)),
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1857,6 +1864,11 @@ struct HttpHostState {
     release_id: Option<String>,
     paddock: Option<Arc<dyn PaddockObjectBackend>>,
     paddock_grants: Vec<PaddockGrant>,
+    paddock_auth: Option<PaddockGatewayAuth>,
+    request_method: String,
+    request_path: String,
+    request_headers: Vec<(String, String)>,
+    request_payload_hash: String,
 }
 
 impl WasiView for P2HostState {
@@ -2261,13 +2273,17 @@ impl paddock_bindings::pitfast::paddock::store::HostWriter for HttpHostState {
         paddock_bindings::pitfast::paddock::store::ObjectRef,
         paddock_bindings::pitfast::paddock::store::Error,
     > {
-        let mut state = self
+        let writer = self
             .table
-            .delete(resource)
-            .map_err(|error| paddock_error(anyhow!(error.to_string())))?;
-        let writer = state.writer.take().ok_or_else(|| {
-            paddock_bindings::pitfast::paddock::store::Error::Conflict("writer finalized".into())
-        })?;
+            .get_mut(&resource)
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))?
+            .writer
+            .take()
+            .ok_or_else(|| {
+                paddock_bindings::pitfast::paddock::store::Error::Conflict(
+                    "writer finalized".into(),
+                )
+            })?;
         writer
             .commit()
             .await
@@ -2279,11 +2295,13 @@ impl paddock_bindings::pitfast::paddock::store::HostWriter for HttpHostState {
         &mut self,
         resource: wasmtime::component::Resource<paddock_bindings::pitfast::paddock::store::Writer>,
     ) -> std::result::Result<(), paddock_bindings::pitfast::paddock::store::Error> {
-        let mut state = self
+        let writer = self
             .table
-            .delete(resource)
-            .map_err(|error| paddock_error(anyhow!(error.to_string())))?;
-        if let Some(writer) = state.writer.take() {
+            .get_mut(&resource)
+            .map_err(|error| paddock_error(anyhow!(error.to_string())))?
+            .writer
+            .take();
+        if let Some(writer) = writer {
             writer.abort().await.map_err(paddock_error)?;
         }
         Ok(())
@@ -2296,6 +2314,235 @@ impl paddock_bindings::pitfast::paddock::store::HostWriter for HttpHostState {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
+}
+
+impl paddock_bindings::pitfast::paddock::auth::Host for HttpHostState {
+    async fn verify(&mut self) -> std::result::Result<(), String> {
+        verify_gateway_signature(self)
+    }
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut padded = [0_u8; 64];
+    if key.len() > padded.len() {
+        padded.copy_from_slice(&Sha256::digest(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = [0_u8; 64];
+    let mut outer = [0_u8; 64];
+    for (index, value) in padded.iter().enumerate() {
+        inner[index] = *value ^ 0x36;
+        outer[index] = *value ^ 0x5c;
+    }
+    let mut inner_input = Vec::with_capacity(64 + message.len());
+    inner_input.extend_from_slice(&inner);
+    inner_input.extend_from_slice(message);
+    let inner_digest = Sha256::digest(inner_input);
+    let mut outer_input = Vec::with_capacity(64 + inner_digest.len());
+    outer_input.extend_from_slice(&outer);
+    outer_input.extend_from_slice(&inner_digest);
+    Sha256::digest(outer_input).into()
+}
+
+fn constant_time_hex_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn header_value(state: &HttpHostState, name: &str) -> Option<String> {
+    state
+        .request_headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+fn aws_percent_encode(value: &[u8]) -> String {
+    value
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+fn canonical_path_and_query(path: &str) -> Result<(String, String), String> {
+    let (raw_path, raw_query) = path.split_once('?').unwrap_or((path, ""));
+    let canonical_path = raw_path
+        .split('/')
+        .map(|part| aws_percent_encode(part.as_bytes()))
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut query = raw_query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (
+                aws_percent_encode(key.as_bytes()),
+                aws_percent_encode(value.as_bytes()),
+            )
+        })
+        .collect::<Vec<_>>();
+    query.sort();
+    Ok((
+        if canonical_path.is_empty() {
+            "/".into()
+        } else {
+            canonical_path
+        },
+        query
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&"),
+    ))
+}
+
+fn parse_amz_timestamp(value: &str) -> Result<i64, String> {
+    if value.len() != 16
+        || value.as_bytes()[8] != b'T'
+        || value.as_bytes()[15] != b'Z'
+        || !value[..8].bytes().all(|byte| byte.is_ascii_digit())
+        || !value[9..15].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("x-amz-date must use YYYYMMDDTHHMMSSZ".into());
+    }
+    let number = |start: usize, end: usize| {
+        value[start..end]
+            .parse::<u8>()
+            .map_err(|_| "x-amz-date contains an invalid number".to_owned())
+    };
+    let year = value[..4]
+        .parse::<i32>()
+        .map_err(|_| "x-amz-date contains an invalid year".to_owned())?;
+    let month = Month::try_from(number(4, 6)?)
+        .map_err(|_| "x-amz-date contains an invalid month".to_owned())?;
+    let date = Date::from_calendar_date(year, month, number(6, 8)?)
+        .map_err(|_| "x-amz-date contains an invalid day".to_owned())?;
+    let clock = ClockTime::from_hms(number(9, 11)?, number(11, 13)?, number(13, 15)?)
+        .map_err(|_| "x-amz-date contains an invalid time".to_owned())?;
+    Ok(date.with_time(clock).assume_utc().unix_timestamp())
+}
+
+fn verify_gateway_signature(state: &HttpHostState) -> std::result::Result<(), String> {
+    let Some(auth) = state.paddock_auth.as_ref() else {
+        return Ok(());
+    };
+    let authorization = header_value(state, "authorization")
+        .ok_or_else(|| "SigV4 Authorization header is required".to_owned())?;
+    let amz_date = header_value(state, "x-amz-date")
+        .ok_or_else(|| "x-amz-date header is required".to_owned())?;
+    let signed_timestamp = parse_amz_timestamp(&amz_date)?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_secs() as i64;
+    if (now - signed_timestamp).abs() > 900 {
+        return Err("request timestamp is outside the 15 minute SigV4 window".into());
+    }
+    let parts = authorization
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .ok_or_else(|| "unsupported authorization scheme".to_owned())?
+        .split(", ")
+        .filter_map(|part| part.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    let credential = parts
+        .get("Credential")
+        .ok_or_else(|| "SigV4 Credential is missing".to_owned())?;
+    let credential_parts = credential.split('/').collect::<Vec<_>>();
+    if credential_parts.len() != 5 || credential_parts[0] != auth.access_key {
+        return Err("invalid SigV4 credential".into());
+    }
+    if credential_parts[1] != &amz_date[..8]
+        || credential_parts[2] != auth.region
+        || credential_parts[3] != "s3"
+        || credential_parts[4] != "aws4_request"
+    {
+        return Err("invalid SigV4 credential scope".into());
+    }
+    let signed_headers = parts
+        .get("SignedHeaders")
+        .ok_or_else(|| "SigV4 SignedHeaders is missing".to_owned())?;
+    let signature = parts
+        .get("Signature")
+        .ok_or_else(|| "SigV4 Signature is missing".to_owned())?;
+    if signature.len() != 64 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid SigV4 signature".into());
+    }
+    let signed = signed_headers.split(';').collect::<Vec<_>>();
+    if signed.windows(2).any(|window| window[0] >= window[1]) {
+        return Err("SigV4 SignedHeaders must be sorted".into());
+    }
+    let mut canonical_headers = String::new();
+    for name in &signed {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("invalid signed header name".into());
+        }
+        let value =
+            header_value(state, name).ok_or_else(|| format!("signed header is missing: {name}"))?;
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(&value.split_whitespace().collect::<Vec<_>>().join(" "));
+        canonical_headers.push('\n');
+    }
+    if !signed.contains(&"host") || !signed.contains(&"x-amz-date") {
+        return Err("host and x-amz-date must be signed".into());
+    }
+    let payload_hash = header_value(state, "x-amz-content-sha256")
+        .unwrap_or_else(|| state.request_payload_hash.clone());
+    if payload_hash != "UNSIGNED-PAYLOAD" && payload_hash != state.request_payload_hash {
+        return Err("x-amz-content-sha256 does not match the request body".into());
+    }
+    let (canonical_uri, canonical_query) = canonical_path_and_query(&state.request_path)?;
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        state.request_method.to_uppercase(),
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        payload_hash
+    );
+    let scope = format!("{}/{}/{}/aws4_request", &amz_date[..8], auth.region, "s3");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex_digest(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let date_key = hmac_sha256(
+        format!("AWS4{}", auth.secret_key).as_bytes(),
+        &amz_date.as_bytes()[..8],
+    );
+    let region_key = hmac_sha256(&date_key, auth.region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"s3");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let expected = hex_digest(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    if !constant_time_hex_eq(&expected, signature) {
+        return Err("signature does not match".into());
+    }
+    Ok(())
 }
 
 struct HostState {
@@ -2488,7 +2735,8 @@ mod tests {
         ArtifactFormat, ArtifactSource, CancellationToken, CompiledCacheConfig,
         CompiledCacheRestoreMode, CompiledCacheSource, ExecutionLimits, ExecutionRequest,
         ExecutionStatus, PitRuntime, PitRuntimeConfig, PreparedArtifact, RuntimeAllocationMode,
-        WasmArtifact, cache_entry_paths, compiled_cache_entry,
+        WasmArtifact, cache_entry_paths, canonical_path_and_query, compiled_cache_entry,
+        parse_amz_timestamp,
     };
     use std::time::Duration;
     use wasmtime::{Config, Engine};
@@ -2511,6 +2759,21 @@ mod tests {
         assert!(request.limits.timeout.is_none());
         assert!(request.limits.memory_bytes.is_none());
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn sigv4_timestamp_requires_valid_utc_datetime() {
+        assert!(parse_amz_timestamp("20260908T120000Z").is_ok());
+        assert!(parse_amz_timestamp("20260230T120000Z").is_err());
+        assert!(parse_amz_timestamp("20260908T120000+00").is_err());
+    }
+
+    #[test]
+    fn sigv4_path_and_query_are_sorted_and_encoded() {
+        let (path, query) = canonical_path_and_query("/a space/utf8?q=z value&b=2&a=1")
+            .expect("canonical path should be valid");
+        assert_eq!(path, "/a%20space/utf8");
+        assert_eq!(query, "a=1&b=2&q=z%20value");
     }
 
     #[test]

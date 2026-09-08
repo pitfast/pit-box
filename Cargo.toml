@@ -24,6 +24,7 @@ pit-paddock-core = { path = "../pit-paddock/crates/pit-paddock-core" }
 pit-paddock-factory = { path = "../pit-paddock/crates/pit-paddock-factory" }
 pit-paddock-fs = { path = "../pit-paddock/crates/pit-paddock-fs" }
 sha2 = "0.10"
+time = "0.3"
 tokio = { version = "1.53", features = ["io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 bytes = "1.10"

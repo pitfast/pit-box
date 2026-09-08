@@ -485,6 +485,7 @@ impl GarageAgent {
             release_id: request.release_id.clone(),
             paddock: self.object_paddock.clone(),
             paddock_grants: self.paddock_grants.clone(),
+            paddock_auth: None,
         };
         self.executions.fetch_add(1, Ordering::Relaxed);
         let dispatcher = Arc::clone(&self.dispatcher);

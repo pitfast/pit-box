@@ -198,6 +198,7 @@ fn main() -> Result<()> {
         release_id: None,
         paddock: None,
         paddock_grants: Vec::new(),
+        paddock_auth: None,
     };
     let runtime_config = PitRuntimeConfig {
         compiled_cache_restore: restore_mode,
