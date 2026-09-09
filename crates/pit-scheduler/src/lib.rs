@@ -81,9 +81,9 @@ pub struct ExecutionReport {
     pub started: SystemTime,
     /// Time spent waiting in the scheduler queue before starting.
     pub queued_for: Duration,
-    /// Time between work becoming schedulable and a lane assignment. This is
-    /// the scheduler's measured Scheduling Gap; with an immediately free lane
-    /// it is zero.
+    /// Time between a lane assignment and the invocation callback beginning.
+    /// This is dispatch overhead, not time spent waiting for a free lane.
+    /// The latter is measured by `queued_for`.
     pub scheduling_gap: Duration,
     /// Wall-clock time spent in the invocation.
     pub duration: Duration,
@@ -344,12 +344,14 @@ impl PitScheduler {
                 .wait(occupied)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         };
+        let assigned_at = Instant::now();
         self.shared_waiting.fetch_sub(1, Ordering::AcqRel);
         drop(occupied);
         on_assigned(execution_id, lane);
         let active = self.shared_active.fetch_add(1, Ordering::AcqRel) + 1;
         self.shared_peak.fetch_max(active, Ordering::AcqRel);
         let queued_for = queued_at.elapsed();
+        let task_started_at = Instant::now();
         let started = SystemTime::now();
         let timer = Instant::now();
         let outcome = task(execution_id, lane);
@@ -367,7 +369,7 @@ impl PitScheduler {
             lane_id: lane,
             started,
             queued_for,
-            scheduling_gap: queued_for,
+            scheduling_gap: task_started_at.duration_since(assigned_at),
             duration,
             success,
             error,
@@ -454,6 +456,7 @@ impl PitScheduler {
 
                         let execution_id = execution_ids[work_index];
                         run_state.queued.fetch_sub(1, Ordering::AcqRel);
+                        let assigned_at = Instant::now();
                         run_state.set_lane(lane.id, LaneState::Running { execution_id });
                         let active = run_state.running.fetch_add(1, Ordering::AcqRel) + 1;
                         run_state.peak_active.fetch_max(active, Ordering::AcqRel);
@@ -464,6 +467,7 @@ impl PitScheduler {
                             queued_for,
                         });
 
+                        let task_started_at = Instant::now();
                         let started = SystemTime::now();
                         let timer = Instant::now();
                         let outcome = task(execution_id, lane.id);
@@ -484,7 +488,7 @@ impl PitScheduler {
                             lane_id: lane.id,
                             started,
                             queued_for,
-                            scheduling_gap: queued_for,
+                            scheduling_gap: task_started_at.duration_since(assigned_at),
                             duration,
                             success,
                             error: error.clone(),
@@ -675,5 +679,20 @@ mod tests {
             .run_many(1, |execution_id, _| Ok(execution_id))
             .expect("second run should complete");
         assert!(second[0].report.execution_id > first[0].report.execution_id);
+    }
+
+    #[test]
+    fn short_execution_is_included_in_event_derived_peak() {
+        let scheduler = PitScheduler::new(1).expect("one lane is valid");
+        let result = scheduler
+            .run_one(|_, _| {
+                thread::sleep(Duration::from_millis(1));
+                Ok::<_, anyhow::Error>(())
+            })
+            .expect("short execution should complete");
+
+        assert!(result.report.duration < Duration::from_millis(100));
+        assert_eq!(scheduler.shared_peak_active(), 1);
+        assert_eq!(scheduler.shared_active(), 0);
     }
 }
