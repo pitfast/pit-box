@@ -858,9 +858,14 @@ impl PitRuntime {
                     let directory = entry.path();
                     let cache_path = directory.join("artifact.cwasm");
                     let metadata_path = directory.join("metadata.json");
-                    let (Ok(bytes), Ok(metadata_bytes)) =
-                        (std::fs::read(&cache_path), std::fs::read(&metadata_path))
-                    else {
+                    // This is a readiness query used by telemetry and must
+                    // stay metadata-only. Reading every compiled cache blob
+                    // here turns a lightweight snapshot into a full scan of
+                    // potentially multi-gigabyte .cwasm files.
+                    let (Ok(cache_metadata), Ok(metadata_bytes)) = (
+                        std::fs::metadata(&cache_path),
+                        std::fs::read(&metadata_path),
+                    ) else {
                         return false;
                     };
                     let Ok(metadata) =
@@ -885,8 +890,9 @@ impl PitRuntime {
                                 std::env::consts::FAMILY
                             )
                         && metadata.architecture == std::env::consts::ARCH
-                        && metadata.compiled_size_bytes == bytes.len() as u64
-                        && !bytes.is_empty()
+                        && cache_metadata.is_file()
+                        && metadata.compiled_size_bytes == cache_metadata.len()
+                        && cache_metadata.len() > 0
                 }) && let Some(name) = digest.file_name().to_str()
                 {
                     values.push(format!("sha256:{name}"));
@@ -2946,6 +2952,35 @@ mod tests {
         assert_eq!(
             PitRuntime::warm_digests(&cache),
             vec![super::artifact_digest(&bytes)]
+        );
+        // Keep the readiness query bounded even when a compiled artifact is
+        // large. A sparse file makes this regression test independent of
+        // available disk space while still exercising the file metadata path.
+        let (cache_path, metadata_path) = cache_entry_paths(&cache, &digest, &fingerprint);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata should exist"))
+                .expect("metadata should be JSON");
+        let large_size = 256 * 1024 * 1024_u64;
+        metadata["compiled_size_bytes"] = serde_json::Value::from(large_size);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata).expect("metadata should serialize"),
+        )
+        .expect("metadata should be writable");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cache_path)
+            .expect("compiled cache should be writable")
+            .set_len(large_size)
+            .expect("sparse compiled cache should be resizable");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            PitRuntime::warm_digests(&cache),
+            vec![super::artifact_digest(&bytes)]
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "warm cache readiness should not read the full compiled artifact"
         );
         let second = compiled_cache_entry(
             &cache,
