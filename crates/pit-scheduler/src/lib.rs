@@ -181,7 +181,7 @@ pub struct PitScheduler {
     lanes: Arc<[ExecutionLane]>,
     next_execution_id: Arc<AtomicU64>,
     run_lock: Arc<Mutex<()>>,
-    shared_lanes: Arc<(Mutex<Vec<bool>>, std::sync::Condvar)>,
+    shared_lanes: Arc<(Mutex<Vec<Option<ExecutionId>>>, std::sync::Condvar)>,
     shared_active: Arc<AtomicUsize>,
     shared_waiting: Arc<AtomicUsize>,
     shared_peak: Arc<AtomicUsize>,
@@ -205,7 +205,7 @@ impl PitScheduler {
             next_execution_id: Arc::new(AtomicU64::new(0)),
             run_lock: Arc::new(Mutex::new(())),
             shared_lanes: Arc::new((
-                Mutex::new(vec![false; lane_count]),
+                Mutex::new(vec![None; lane_count]),
                 std::sync::Condvar::new(),
             )),
             shared_active: Arc::new(AtomicUsize::new(0)),
@@ -230,7 +230,7 @@ impl PitScheduler {
             next_execution_id: Arc::new(AtomicU64::new(0)),
             run_lock: Arc::new(Mutex::new(())),
             shared_lanes: Arc::new((
-                Mutex::new(vec![false; lane_count]),
+                Mutex::new(vec![None; lane_count]),
                 std::sync::Condvar::new(),
             )),
             shared_active: Arc::new(AtomicUsize::new(0)),
@@ -297,14 +297,10 @@ impl PitScheduler {
             peak_active: self.shared_peak_active(),
             lanes: occupied
                 .iter()
-                .map(|used| {
-                    if *used {
-                        LaneState::Running {
-                            execution_id: ExecutionId(0),
-                        }
-                    } else {
-                        LaneState::Free
-                    }
+                .map(|execution_id| {
+                    execution_id.map_or(LaneState::Free, |execution_id| LaneState::Running {
+                        execution_id,
+                    })
                 })
                 .collect(),
         }
@@ -318,14 +314,30 @@ impl PitScheduler {
         T: Send + 'static,
         F: FnOnce(ExecutionId, LaneId) -> Result<T>,
     {
+        self.run_one_observed(task, |_, _| {})
+    }
+
+    /// Runs one task and invokes `on_assigned` after a concrete lane has been
+    /// reserved, before the task starts. The observer is intentionally
+    /// side-channel telemetry; it cannot affect lane ownership or admission.
+    pub fn run_one_observed<T, F, O>(&self, task: F, on_assigned: O) -> Result<ExecutionResult<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(ExecutionId, LaneId) -> Result<T>,
+        O: FnOnce(ExecutionId, LaneId),
+    {
         let execution_id = ExecutionId(self.next_execution_id.fetch_add(1, Ordering::Relaxed));
         let queued_at = Instant::now();
         self.shared_waiting.fetch_add(1, Ordering::AcqRel);
         let (lock, wake) = &*self.shared_lanes;
         let mut occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let lane = loop {
-            if let Some((index, slot)) = occupied.iter_mut().enumerate().find(|(_, used)| !**used) {
-                *slot = true;
+            if let Some((index, slot)) = occupied
+                .iter_mut()
+                .enumerate()
+                .find(|(_, execution_id)| execution_id.is_none())
+            {
+                *slot = Some(execution_id);
                 break LaneId(index);
             }
             occupied = wake
@@ -334,6 +346,7 @@ impl PitScheduler {
         };
         self.shared_waiting.fetch_sub(1, Ordering::AcqRel);
         drop(occupied);
+        on_assigned(execution_id, lane);
         let active = self.shared_active.fetch_add(1, Ordering::AcqRel) + 1;
         self.shared_peak.fetch_max(active, Ordering::AcqRel);
         let queued_for = queued_at.elapsed();
@@ -360,7 +373,7 @@ impl PitScheduler {
             error,
         };
         let mut occupied = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        occupied[lane.0] = false;
+        occupied[lane.0] = None;
         self.shared_active.fetch_sub(1, Ordering::AcqRel);
         wake.notify_one();
         Ok(ExecutionResult { report, value })

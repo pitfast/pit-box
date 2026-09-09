@@ -9,8 +9,7 @@ use pit_artifact::{ArtifactFormat, ComponentWorld, RuntimeSpec};
 use pit_lane_core::ServiceInvoker;
 use pit_runtime::{PitRuntime, PreparedArtifact, RuntimeExecutionResult};
 use pit_scheduler::{
-    ExecutionEvent, ExecutionId, ExecutionReport, LaneId, PitScheduler, SchedulerRun,
-    SchedulerSnapshot,
+    ExecutionEvent, ExecutionReport, PitScheduler, SchedulerRun, SchedulerSnapshot,
 };
 
 pub use pit_runtime::{
@@ -19,6 +18,16 @@ pub use pit_runtime::{
     HttpRequest, HttpResponse, PitRuntimeConfig, PreparationReport, ReadinessState,
     RuntimeAllocationMode, WasmArtifact, validate_env_entry,
 };
+pub use pit_scheduler::LaneState;
+pub use pit_scheduler::{ExecutionId, LaneId};
+
+pub struct HttpDispatchOptions<O> {
+    pub limits: ExecutionLimits,
+    pub cancellation: CancellationToken,
+    pub service_invoker: Option<Arc<dyn ServiceInvoker>>,
+    pub invocation_depth: u16,
+    pub on_assigned: O,
+}
 
 /// Validate a project artifact's runtime contract against this local PitBox.
 pub fn validate_runtime_spec(spec: &RuntimeSpec) -> Result<()> {
@@ -251,6 +260,38 @@ impl PitHttpDispatcher {
         service_invoker: Option<Arc<dyn ServiceInvoker>>,
         invocation_depth: u16,
     ) -> Result<HttpDispatchResult> {
+        self.execute_http_with_invoker_observed(
+            key,
+            request,
+            HttpDispatchOptions {
+                limits,
+                cancellation,
+                service_invoker,
+                invocation_depth,
+                on_assigned: |_, _| {},
+            },
+        )
+    }
+
+    /// Executes an HTTP request and reports the concrete scheduler assignment
+    /// to an observational callback. The callback is outside the scheduler's
+    /// ownership decisions and exists for read-only telemetry only.
+    pub fn execute_http_with_invoker_observed<O>(
+        &self,
+        key: &str,
+        request: HttpRequest,
+        options: HttpDispatchOptions<O>,
+    ) -> Result<HttpDispatchResult>
+    where
+        O: FnOnce(ExecutionId, LaneId) + Send + 'static,
+    {
+        let HttpDispatchOptions {
+            limits,
+            cancellation,
+            service_invoker,
+            invocation_depth,
+            on_assigned,
+        } = options;
         let request_received = Instant::now();
         let lookup_started = Instant::now();
         let prepared = self
@@ -264,17 +305,20 @@ impl PitHttpDispatcher {
         let request = Arc::new(request);
         let guest_started = Arc::new(std::sync::Mutex::new(None));
         let guest_started_for_task = Arc::clone(&guest_started);
-        let scheduled = self.scheduler.run_one(move |execution_id, _| {
-            *guest_started_for_task.lock().unwrap() = Some(request_received.elapsed());
-            prepared.execute_http_with_invoker_timed(
-                &request,
-                cancellation.clone(),
-                limits.clone(),
-                service_invoker,
-                Some(execution_id.to_string()),
-                invocation_depth,
-            )
-        })?;
+        let scheduled = self.scheduler.run_one_observed(
+            move |execution_id, _| {
+                *guest_started_for_task.lock().unwrap() = Some(request_received.elapsed());
+                prepared.execute_http_with_invoker_timed(
+                    &request,
+                    cancellation.clone(),
+                    limits.clone(),
+                    service_invoker,
+                    Some(execution_id.to_string()),
+                    invocation_depth,
+                )
+            },
+            on_assigned,
+        )?;
         let report = scheduled.report;
         let (response, runtime_timings) = scheduled.value.map_or_else(
             || (None, HttpExecutionTimings::default()),
